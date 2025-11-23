@@ -256,6 +256,97 @@ void update_matrix(
     free(votes); free(A); free(B);
 }
 
+// --- Sampling Helper ---
+#define COLOR_GREEN "\033[32m"
+#define COLOR_CYAN  "\033[36m"
+#define COLOR_RESET "\033[0m"
+
+int sample_logits(int8_t *logits) {
+    int32_t probs[VOCAB_SIZE];
+    int32_t sum = 0;
+    for(int i=0; i<VOCAB_SIZE; i++) {
+        int idx = (int32_t)logits[i] + 128;
+        idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
+        probs[i] = EXP2_TABLE[idx];
+        sum += probs[i];
+    }
+    if(sum == 0) return 0;
+    int32_t r = rand() % sum;
+    int32_t acc = 0;
+    for(int i=0; i<VOCAB_SIZE; i++) {
+        acc += probs[i];
+        if(r < acc) return i;
+    }
+    return VOCAB_SIZE - 1;
+}
+
+void sample_model(EggModel *model, const uint8_t *seed_text, int seed_len, int gen_len) {
+    int8_t x[HIDDEN_DIM], residual[HIDDEN_DIM], state[N_LAYERS][HIDDEN_DIM];
+    int8_t buf1[HIDDEN_DIM], buf2[HIDDEN_DIM];
+    int8_t logits[VOCAB_SIZE];
+    memset(state, 0, sizeof(state));
+
+    printf(COLOR_GREEN);
+    int input_token = 0;
+    
+    for(int t=0; t < seed_len + gen_len; t++) {
+        if (t < seed_len) {
+            input_token = seed_text[t];
+            if(input_token >= 32 && input_token <= 126) printf("%c", input_token);
+            else printf(".");
+        } else {
+            if (t == seed_len) printf(COLOR_CYAN);
+            if(input_token >= 32 && input_token <= 126) printf("%c", input_token);
+            else printf(".");
+        }
+
+        // -- Forward Layer Logic --
+        memcpy(x, &model->embedding[input_token * HIDDEN_DIM], HIDDEN_DIM);
+
+        for(int l=0; l<N_LAYERS; l++) {
+            // GRU
+            memcpy(residual, x, HIDDEN_DIM);
+            egg_ln(x, model->ln_weights[l][0], x);
+
+            matmul_perturbed(x, model->gru_weights[l][0], buf1, HIDDEN_DIM, HIDDEN_DIM, 0, 0);
+            matmul_perturbed(state[l], model->gru_weights[l][1], buf2, HIDDEN_DIM, HIDDEN_DIM, 0, 0);
+            int8_t ft[HIDDEN_DIM];
+            for(int i=0; i<HIDDEN_DIM; i++) ft[i] = clipped_add(clipped_add(buf1[i], buf2[i]), model->gru_biases[l][0][i]);
+
+            int8_t gated_past[HIDDEN_DIM];
+            for(int i=0; i<HIDDEN_DIM; i++) gated_past[i] = (int8_t)(((int32_t)(ft[i] + 127) * state[l][i]) >> 8);
+
+            matmul_perturbed(x, model->gru_weights[l][2], buf1, HIDDEN_DIM, HIDDEN_DIM, 0, 0);
+            matmul_perturbed(gated_past, model->gru_weights[l][3], buf2, HIDDEN_DIM, HIDDEN_DIM, 0, 0);
+            int8_t ht[HIDDEN_DIM];
+            for(int i=0; i<HIDDEN_DIM; i++) ht[i] = clipped_add(clipped_add(buf1[i], buf2[i]), model->gru_biases[l][1][i]);
+
+            for(int i=0; i<HIDDEN_DIM; i++) {
+                int32_t update = ((int32_t)(ft[i] + 127) * (ht[i] - state[l][i])) >> 8;
+                state[l][i] = clipped_add(state[l][i], update);
+                x[i] = state[l][i];
+            }
+            for(int i=0; i<HIDDEN_DIM; i++) x[i] = clipped_add(x[i], residual[i]);
+
+            // MLP
+            memcpy(residual, x, HIDDEN_DIM);
+            egg_ln(x, model->ln_weights[l][1], x);
+            matmul_perturbed(x, model->mlp_weights[l][0], buf1, HIDDEN_DIM, HIDDEN_DIM, 0, 0);
+            matmul_perturbed(buf1, model->mlp_weights[l][1], x, HIDDEN_DIM, HIDDEN_DIM, 0, 0);
+            for(int i=0; i<HIDDEN_DIM; i++) x[i] = clipped_add(x[i], residual[i]);
+        }
+
+        // -- Predict Next Token --
+        egg_ln(x, model->ln_out, x);
+        matmul_perturbed(x, model->head, logits, VOCAB_SIZE, HIDDEN_DIM, 0, 0);
+        
+        if (t >= seed_len - 1) {
+            input_token = sample_logits(logits);
+        }
+    }
+    printf(COLOR_RESET "\n");
+}
+
 // --- Main Training Loop ---
 
 Dataset load_data(const char *filename) {
@@ -271,6 +362,7 @@ Dataset load_data(const char *filename) {
 }
 
 int main() {
+    srand(time(NULL));
     init_tables();
     Dataset ds = load_data("input.txt");
     printf("Loaded dataset: %ld bytes\n", ds.length);
@@ -291,17 +383,33 @@ int main() {
     int8_t *logits = (int8_t*)malloc(VOCAB_SIZE);
 
     printf("Starting EGGROLL Training...\n");
+    
+    clock_t start_time = clock();
+    long total_tokens = 0;
+    long max_steps = (ds.length - 1) / SEQ_LEN;
 
-    for(int step=0; step<1000; step++) {
+    for(long step=0; step < max_steps; step++) {
         uint32_t step_seed = (uint32_t)time(NULL) + step;
+        int start_idx = step * SEQ_LEN;
         
+        // Visual Sampling
+        if(step % 10 == 0) {
+            sample_model(model, &ds.data[start_idx], 16, 20);
+        }
+
+        // Monitoring
+        if(step % 1 == 0) {
+            forward_pass(model, &ds.data[start_idx], SEQ_LEN, logits, step_seed, 0);
+            int32_t loss_val = compute_loss(logits, ds.data[start_idx + SEQ_LEN]);
+            double elapsed_sec = (double)(clock() - start_time) / CLOCKS_PER_SEC;
+            double tps = (elapsed_sec > 0) ? (double)total_tokens / elapsed_sec : 0.0;
+            printf("Step %ld/%ld | Loss: %.4f | Tok/s: %.2f\n", step, max_steps, (double)loss_val / (1 << FIXED_POINT), tps);
+        }
+
         // 1. Evaluate Population
         // We use antithetical pairs: (seed, +1) and (seed, -1)
         for(int p=0; p < POPULATION_SIZE; p+=2) {
             uint32_t p_seed = step_seed + (p/2); 
-            
-            // Pick a random batch location
-            int start_idx = rand() % (ds.length - SEQ_LEN - 1);
             
             // Pos Run
             forward_pass(model, &ds.data[start_idx], SEQ_LEN, logits, p_seed, 1);
@@ -331,7 +439,7 @@ int main() {
         }
         update_matrix(model->head, VOCAB_SIZE, HIDDEN_DIM, step_seed+999, pair_fitnesses, POPULATION_SIZE);
 
-        if(step % 10 == 0) printf("Step %d complete.\n", step);
+        total_tokens += SEQ_LEN;
     }
 
     printf("Training Done.\n");
