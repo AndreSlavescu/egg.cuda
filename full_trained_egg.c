@@ -9,9 +9,9 @@
 #define VOCAB_SIZE 256        // Byte-level tokenization
 #define HIDDEN_DIM 128        // Model width
 #define N_LAYERS 4            // Number of layers
-#define SEQ_LEN 64            // Sequence length for BPTT (truncated)
-#define POPULATION_SIZE 64    // Number of perturbations per step
-#define BATCH_SIZE 32          // Parallel streams
+#define SEQ_LEN 128            // Sequence length for BPTT (truncated)
+#define POPULATION_SIZE 256    // Number of perturbations per step
+#define BATCH_SIZE 128          // Parallel streams
 #define FIXED_POINT 4         // 4 bits for fractional part
 #define SIGMA_SHIFT 4         // Noise scale (bitwise shift)
 #define UPDATE_THRESHOLD 100  // Votes needed to flip a weight [cite: 1023]
@@ -19,7 +19,7 @@
 #define MIN_VAL -127
 
 // --- Lookup Tables [cite: 998-1000] ---
-int32_t LOG2_TABLE[1024];
+// int32_t LOG2_TABLE[1024]; // Removed: insufficient size
 int32_t EXP2_TABLE[256];
 
 // --- Data Structure ---
@@ -48,10 +48,6 @@ typedef struct {
 void init_tables() {
     for(int i=0; i<256; i++) 
         EXP2_TABLE[i] = (int32_t)(pow(2.0, (double)i / (1 << FIXED_POINT)) * (1 << FIXED_POINT));
-    for(int i=0; i<1024; i++) {
-        if(i==0) LOG2_TABLE[i] = 0;
-        else LOG2_TABLE[i] = (int32_t)(log2((double)i / (1 << FIXED_POINT)) * (1 << FIXED_POINT));
-    }
 }
 
 // Saturated Addition [cite: 283, 936]
@@ -208,6 +204,36 @@ void forward_pass(
     }
 }
 
+// --- Helper for Loss Calculation ---
+static inline int get_msb(uint32_t n) {
+    int pos = 0;
+    if (n >= 1<<16) { n >>= 16; pos += 16; }
+    if (n >= 1<<8)  { n >>= 8;  pos += 8; }
+    if (n >= 1<<4)  { n >>= 4;  pos += 4; }
+    if (n >= 1<<2)  { n >>= 2;  pos += 2; }
+    if (n >= 1<<1)  {           pos += 1; }
+    return pos;
+}
+
+// Returns 16 * log2(x / 16)
+int32_t log2_fixed(int32_t x) {
+    if (x <= 0) return 0; // Check for safety
+    int k = get_msb(x);
+    // We want 16 * log2(x) - 64
+    // log2(x) approx k + (x - 2^k)/2^k
+    // 16*log2(x) approx 16*k + 16*(x - 2^k)/2^k
+    
+    // fraction calculation safely:
+    int32_t fraction;
+    if (k >= 4) {
+        fraction = (x - (1 << k)) >> (k - 4);
+    } else {
+        fraction = (x - (1 << k)) << (4 - k);
+    }
+    
+    return (k << 4) + fraction - 64;
+}
+
 // --- Loss Calculation [cite: 994-997] ---
 int32_t compute_loss(int8_t *logits, uint8_t target) {
     int32_t sum_exp = 0;
@@ -215,7 +241,8 @@ int32_t compute_loss(int8_t *logits, uint8_t target) {
         int idx = (int32_t)logits[i] + 128;
         sum_exp += EXP2_TABLE[idx < 0 ? 0 : (idx > 255 ? 255 : idx)];
     }
-    int32_t log_sum = (sum_exp < 1024) ? LOG2_TABLE[sum_exp] : LOG2_TABLE[1023];
+    // Fix: Use full range log2 approximation instead of small table
+    int32_t log_sum = log2_fixed(sum_exp);
     int32_t target_logit = (int32_t)logits[target] + 128;
     return log_sum - target_logit;
 }
@@ -396,7 +423,7 @@ int main() {
         
         // Visual Sampling
         if(step % 10 == 0) {
-            sample_model(model, &ds.data[start_idx], 16, 20);
+            sample_model(model, &ds.data[start_idx], 30, 30);
         }
 
         // Monitoring
