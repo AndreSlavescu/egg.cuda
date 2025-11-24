@@ -9,7 +9,7 @@
 
 // --- Configuration [cite: 275, 277, 288] ---
 #define VOCAB_SIZE 256        // Byte-level tokenization
-#define HIDDEN_DIM 128        // Model width
+#define HIDDEN_DIM 512        // Model width
 #define N_LAYERS 4            // Number of layers
 #define SEQ_LEN 4096            // Sequence length for BPTT (truncated)
 #define POPULATION_SIZE 128    // Number of perturbations per step
