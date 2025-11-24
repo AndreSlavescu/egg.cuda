@@ -20,6 +20,10 @@
 #define MAX_VAL 127
 #define MIN_VAL -127
 
+// Derived Constants for Optimization
+#define MAX_MATRIX_DIM (HIDDEN_DIM * 4) // Largest dimension (MLP expansion)
+#define MAX_POP_PAIRS (POPULATION_SIZE / 2)
+
 // --- Lookup Tables [cite: 998-1000] ---
 int32_t EXP2_TABLE[256];
 
@@ -342,66 +346,76 @@ void update_matrix(
     const int *fitnesses, 
     int pop_size
 ) {
-    static int32_t votes[65536 * 4];
-    memset(votes, 0, rows * cols * sizeof(int32_t));
+    // Optimized "Inverted Loop" Strategy:
+    // 1. Pre-compute and transpose noise vectors into compact buffers.
+    // 2. Single pass over weights to compute votes (dot product over population) and update.
+    // This eliminates the large 'votes' memset and repeated sweeps.
 
-    int8_t A[rows];
-    int8_t B[cols];
+    // Transposed buffers: [index][population_pair_index]
+    // A_T stores A * f directly.
+    static int8_t A_T[MAX_MATRIX_DIM][MAX_POP_PAIRS] __attribute__((aligned(16)));
+    static int8_t B_T[MAX_MATRIX_DIM][MAX_POP_PAIRS] __attribute__((aligned(16)));
+    
+    int pairs = pop_size / 2;
+    if (pairs > MAX_POP_PAIRS) pairs = MAX_POP_PAIRS;
 
-    // Parallelize inner reconstruction loops? No, outer loop pop_size logic is easier.
-    // But here we are outside the parallel block. We are aggregating.
-    // Can we enable parallel "Vote" accumulation?
-    // Yes, if we segment the population or the matrix.
-    // Or just use simple loop, since updating is less frequent than forward pass logic?
-    // Actually update is O(pop_size * weight_size). Forward is O(seq_len * layers * weight_size).
-    // Seq_len=128, Pop=256.
-    // Update happens ONCE per step.
-    // Forward happens POP_SIZE times per step.
-    // So Forward optimization is 256x more important. Update is relatively cheap.
-    // We keep update single threaded for simplicity or use simple dispatch if needed.
-    // Let's stick to serial update for now to avoid race conditions or complex reduction.
+    // 1. Pre-compute Noise and Transpose
+    for(int p=0; p<pairs; p++) {
+        int f = fitnesses[p];
+        uint32_t rng = seed + p;
 
-    for(int p=0; p<pop_size; p+=2) {
-        uint32_t p_seed = seed + (p/2);
-        uint32_t rng = p_seed;
-        gen_noise_vector_neon(&rng, A, rows);
-        gen_noise_vector_neon(&rng, B, cols);
+        int8_t A_temp[MAX_MATRIX_DIM];
+        int8_t B_temp[MAX_MATRIX_DIM];
+        
+        gen_noise_vector_neon(&rng, A_temp, rows);
+        gen_noise_vector_neon(&rng, B_temp, cols);
 
-        int f = fitnesses[p/2];
-        if (f == 0) continue;
-
-        // Vote = f * (AB^T)
-        // Vectorize this outer product update?
-        // W[i,j] += f * A[i] * B[j]
-        for(int i=0; i<rows; i++) {
-            int32_t val_A = A[i] * f; // Premultiply f
-            int j = 0;
-            int32x4_t val_A_v = vdupq_n_s32(val_A);
-            for(; j <= cols - 4; j+=4) {
-                // Load B[j..j+3]
-                // int8 -> int32
-                int8_t *b_ptr = &B[j];
-                int32_t b0 = b_ptr[0];
-                int32_t b1 = b_ptr[1];
-                int32_t b2 = b_ptr[2];
-                int32_t b3 = b_ptr[3];
-                int32_t b_vals[4] = {b0, b1, b2, b3};
-                int32x4_t b_v = vld1q_s32(b_vals);
-                int32x4_t prod = vmulq_s32(val_A_v, b_v);
-                
-                int32_t *vote_ptr = &votes[i*cols + j];
-                int32x4_t v_old = vld1q_s32(vote_ptr);
-                vst1q_s32(vote_ptr, vaddq_s32(v_old, prod));
-            }
-            for(; j<cols; j++) {
-                votes[i*cols + j] += val_A * B[j];
-            }
+        if (f == 0) {
+            for(int r=0; r<rows; r++) A_T[r][p] = 0;
+        } else {
+            for(int r=0; r<rows; r++) A_T[r][p] = (int8_t)(A_temp[r] * f);
+            for(int c=0; c<cols; c++) B_T[c][p] = B_temp[c];
         }
     }
 
-    for(int i=0; i<rows*cols; i++) {
-        if(votes[i] > UPDATE_THRESHOLD && W[i] < MAX_VAL) W[i]++;
-        else if(votes[i] < -UPDATE_THRESHOLD && W[i] > MIN_VAL) W[i]--;
+    // 2. Compute Votes and Update Weights (Single Pass)
+    for(int r=0; r<rows; r++) {
+        int8_t *w_row = &W[r * cols];
+        int8_t *a_ptr = A_T[r];
+
+        for(int c=0; c<cols; c++) {
+            int8_t *b_ptr = B_T[c];
+            
+            // Vectorized dot product across population pairs
+            int32x4_t acc_v = vdupq_n_s32(0);
+            
+            // Process in blocks of 16 (NEON int8x16)
+            // Assumption: pairs is a multiple of 16 or we handle tail roughly. 
+            // For now, assuming POPULATION_SIZE is multiple of 32.
+            for(int p=0; p <= pairs - 16; p += 16) {
+                int8x16_t va = vld1q_s8(&a_ptr[p]);
+                int8x16_t vb = vld1q_s8(&b_ptr[p]);
+                int16x8_t prod1 = vmull_s8(vget_low_s8(va), vget_low_s8(vb));
+                int16x8_t prod2 = vmull_s8(vget_high_s8(va), vget_high_s8(vb));
+                acc_v = vpadalq_s16(acc_v, prod1);
+                acc_v = vpadalq_s16(acc_v, prod2);
+            }
+            // Handle remaining pairs if any (scalar fallback or smaller vector)
+            // Since MAX_POP_PAIRS comes from POPULATION_SIZE, let's keep it simple.
+            // The original logic was fixed 32. This loop handles N*16.
+
+            int32_t vote = vaddvq_s32(acc_v);
+
+            // Scalar loop for remainder not needed if we ensure population size is aligned,
+            // but for safety:
+            for(int p = (pairs & ~15); p < pairs; p++) {
+                vote += (int32_t)a_ptr[p] * (int32_t)b_ptr[p];
+            }
+
+            // Apply Update
+            if(vote > UPDATE_THRESHOLD && w_row[c] < MAX_VAL) w_row[c]++;
+            else if(vote < -UPDATE_THRESHOLD && w_row[c] > MIN_VAL) w_row[c]--;
+        }
     }
 }
 
