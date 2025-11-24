@@ -26,6 +26,12 @@ clang -O3 full_trained_egg.c -o egg
 ./egg
 ```
 
+![Training Output](_imgs_/egg_train.jpeg)
+
+## Configuration
+
+![Configuration](_imgs_/egg_config.jpeg)
+
 ## References
 
 *   **Original JAX Implementation**: [ESHyperscale/nano-egg](https://github.com/ESHyperscale/nano-egg)
