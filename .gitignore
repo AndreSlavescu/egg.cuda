@@ -1,0 +1,12 @@
+input.txt
+wikigen/wikitext_combined.txt
+wikigen/*.txt
+wikigen/cache/
+
+egg_gpu
+egg_cpu
+*.o
+
+__pycache__/
+*.pyc
+.cache/
