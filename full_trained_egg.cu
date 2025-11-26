@@ -1,13 +1,3 @@
-/**
- * CUDA EGGROLL - Optimized with Parallel RNG + H100 TMA support
- * 
- * Key optimizations:
- * 1. Hash-based RNG for O(1) noise access
- * 2. Vectorized loads (float4) for memory bandwidth
- * 3. TMA async copies on H100 (SM90+)
- * 4. cuBLAS TF32 for matrix multiplies
- */
-
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <stdio.h>
@@ -17,16 +7,8 @@
 #include <string.h>
 #include <time.h>
 
-// Optional INT8 Tensor Core support (H100 only)
 #ifdef USE_INT8_TC
 #include "int8_tc.cuh"
-#endif
-
-// Check for H100 (SM90) at compile time
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-#define USE_TMA 1
-#else
-#define USE_TMA 0
 #endif
 
 #define VOCAB_SIZE 256
