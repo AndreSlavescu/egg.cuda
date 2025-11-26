@@ -33,6 +33,11 @@
 #define SEED_OFF_GRU_M4 4
 #define SEED_OFF_MLP_EXP 5
 #define SEED_OFF_MLP_PROJ 6
+#define SEED_OFF_GRU_B1 7
+#define SEED_OFF_GRU_B2 8
+#define SEED_OFF_LN_W1 9
+#define SEED_OFF_LN_W2 10
+#define SEED_OFF_LN_OUT 11
 #define SEED_OFF_HEAD 999
 
 #define CHECK_CUDA(call) { \
@@ -164,6 +169,9 @@ __device__ __forceinline__ long long blockReduceSum64(long long val) {
     int lane = threadIdx.x % 32;
     int wid = threadIdx.x / 32;
     
+    if (threadIdx.x < 32) shared[threadIdx.x] = 0;
+    __syncthreads();
+
     val = warpReduceSum64(val);
     
     if (lane == 0) {
@@ -446,6 +454,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
         __syncwarp();
         
         for (int l = 0; l < N_LAYERS; l++) {
+            uint32_t seed = (step_seed + pair_idx) + (l * 100);
+
             // LN 1
             long long local_sum = 0;
             int8_t gru_resid[MAX_STRIDE];
@@ -459,7 +469,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
             if(!sum) sum=1; long long mean = sum/HIDDEN_DIM; if(!mean) mean=1;
             
             for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
-                my_s_ptr[i] = clip(((long long)my_s_ptr[i] * model->ln_weights[l][0][i]) / mean);
+                int8_t w = model->ln_weights[l][0][i];
+                int8_t a = noise_from_hash(seed + SEED_OFF_LN_W1, i);
+                long long perturb = ((long long)a * ns) >> SIGMA_SHIFT;
+                my_s_ptr[i] = clip(((long long)my_s_ptr[i] * (w + perturb)) / mean);
             }
             __syncwarp();
             
@@ -470,7 +483,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
             __syncwarp();
 
             // Rank-1 Precalc (xB) for GRU Phase 1
-            uint32_t seed = (step_seed + pair_idx) + (l * 100); 
+            // seed already calculated above
             
             long long ls_1 = 0, ls_2 = 0;
             for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
@@ -503,7 +516,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
                  int8_t a2 = noise_from_hash(seed + SEED_OFF_GRU_M2, i);
                  if(ns!=0) dot2 += ((xB_m2 * (long long)a2) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
                  
-                 int8_t ft = clip((dot1 >> 8) + (dot2 >> 8) + model->gru_biases[l][0][i]);
+                 int8_t b_gate = model->gru_biases[l][0][i];
+                 int8_t a_gate = noise_from_hash(seed + SEED_OFF_GRU_B1, i);
+                 long long p_gate = ((long long)a_gate * ns) >> SIGMA_SHIFT;
+
+                 int8_t ft = clip((dot1 >> 8) + (dot2 >> 8) + (b_gate + p_gate));
                  int8_t h_val = my_s_ptr[HIDDEN_DIM + i];
                  int8_t gated = (int8_t)(((long long)(ft + 127) * h_val) >> 8);
                  
@@ -543,7 +560,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
                 int8_t a4 = noise_from_hash(seed + SEED_OFF_GRU_M4, i);
                 if(ns!=0) dot2 += ((xB_m4 * (long long)a4) * ns) >> (FIXED_POINT + SIGMA_SHIFT);
                 
-                int8_t ht = clip((dot1 >> 8) + (dot2 >> 8) + model->gru_biases[l][1][i]);
+                int8_t b_ht = model->gru_biases[l][1][i];
+                int8_t a_ht = noise_from_hash(seed + SEED_OFF_GRU_B2, i);
+                long long p_ht = ((long long)a_ht * ns) >> SIGMA_SHIFT;
+
+                int8_t ht = clip((dot1 >> 8) + (dot2 >> 8) + (b_ht + p_ht));
                 
                 int8_t ft = my_s_ptr[3*HIDDEN_DIM + i];
                 int8_t h_curr = h_local[l][i / WARP_SIZE];
@@ -571,7 +592,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
             if(!sum_mlp) sum_mlp=1; long long mean_mlp = sum_mlp/HIDDEN_DIM; if(!mean_mlp) mean_mlp=1;
 
             for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
-                my_s_ptr[i] = clip(((long long)my_s_ptr[i] * model->ln_weights[l][1][i]) / mean_mlp);
+                int8_t w = model->ln_weights[l][1][i];
+                int8_t a = noise_from_hash(seed + SEED_OFF_LN_W2, i);
+                long long p = ((long long)a * ns) >> SIGMA_SHIFT;
+                my_s_ptr[i] = clip(((long long)my_s_ptr[i] * (w + p)) / mean_mlp);
             }
             __syncwarp(); 
             
@@ -650,8 +674,12 @@ __global__ void __launch_bounds__(BLOCK_THREADS) train_sequence_kernel(
         long long sum = warpReduceSum64(local_sum);
         if(!sum) sum=1; long long mean = sum/HIDDEN_DIM; if(!mean) mean=1;
         
+        uint32_t seed_ln_out = (step_seed+pair_idx);
         for (int i = lane_id; i < HIDDEN_DIM; i += WARP_SIZE) {
-             my_s_ptr[i] = clip(((long long)my_s_ptr[i] * model->ln_out[i]) / mean);
+             int8_t w = model->ln_out[i];
+             int8_t a = noise_from_hash(seed_ln_out + SEED_OFF_LN_OUT, i);
+             long long p = ((long long)a * ns) >> SIGMA_SHIFT;
+             my_s_ptr[i] = clip(((long long)my_s_ptr[i] * (w + p)) / mean);
         }
         __syncwarp();
         
@@ -771,6 +799,43 @@ __global__ void update_matrix_kernel(
     W[c * rows + r] = w_curr; 
 }
 
+__global__ void update_vector_kernel(
+    int8_t * __restrict__ V,
+    int len,
+    int seed_off_A,
+    int seed_base_add,
+    const int32_t * __restrict__ fitnesses,
+    uint32_t step_seed
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) return;
+    
+    long long vote = 0;
+    
+    for(int p=0; p < POPULATION_SIZE/2; p++) {
+        int fit = fitnesses[p];
+        
+        uint32_t s = step_seed + p + seed_base_add;
+        int8_t a = noise_from_hash(s + seed_off_A, idx);
+        
+        if (fit == 0) continue;
+        
+        vote += (long long)fit * (int)a;
+    }
+    
+    int8_t v_curr = V[idx];
+
+    if(vote > UPDATE_THRESHOLD && v_curr < MAX_VAL) {
+        v_curr++;
+        atomicAdd(&d_debug_updates[0], 1);
+    }
+    else if(vote < -UPDATE_THRESHOLD && v_curr > MIN_VAL) {
+        v_curr--;
+        atomicAdd(&d_debug_updates[1], 1);
+    }
+    V[idx] = v_curr; 
+}
+
 int main() {
     srand(time(NULL));
     
@@ -888,8 +953,20 @@ int main() {
                  0, HIDDEN_DIM, 
                  seed_base + SEED_OFF_MLP_PROJ, d_fitnesses, seed
              );
+
+             // Biases & LN
+             long off_b = offsetof(EggModel, gru_biases) + (l * 2 * HIDDEN_DIM);
+             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_b, HIDDEN_DIM, SEED_OFF_GRU_B1, seed_base, d_fitnesses, seed);
+             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_b + HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_GRU_B2, seed_base, d_fitnesses, seed);
+
+             long off_ln = offsetof(EggModel, ln_weights) + (l * 2 * HIDDEN_DIM);
+             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_ln, HIDDEN_DIM, SEED_OFF_LN_W1, seed_base, d_fitnesses, seed);
+             update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_ln + HIDDEN_DIM, HIDDEN_DIM, SEED_OFF_LN_W2, seed_base, d_fitnesses, seed);
         }
         
+        long off_ln_out = offsetof(EggModel, ln_out);
+        update_vector_kernel<<< (HIDDEN_DIM+511)/512, 512 >>>((int8_t*)d_model + off_ln_out, HIDDEN_DIM, SEED_OFF_LN_OUT, 0, d_fitnesses, seed);
+
         long off_head = offsetof(EggModel, head);
         update_matrix_kernel<<< (VOCAB_SIZE*HIDDEN_DIM + 511)/512, 512 >>>(
             (int8_t*)d_model + off_head, VOCAB_SIZE, HIDDEN_DIM, 
