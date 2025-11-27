@@ -1,11 +1,15 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
 #include <string.h>
 #include <time.h>
+
+namespace cg = cooperative_groups;
 
 #ifdef USE_INT8_TC
 #include "int8_tc.cuh"
@@ -82,7 +86,6 @@ __device__ __forceinline__ int32_t log2_fixed(int32_t x) {
     return (k << 4) + frac - 64;
 }
 
-// Fused embedding + LN
 __global__ void __launch_bounds__(256)
 fused_embed_ln_kernel(
     const uint8_t* __restrict__ data,
@@ -93,6 +96,9 @@ fused_embed_ln_kernel(
     const long* __restrict__ offsets,
     int t
 ) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
     int pop = blockIdx.x;
     int tid = threadIdx.x;
     
@@ -102,33 +108,102 @@ fused_embed_ln_kernel(
     
     uint8_t token = data[(offsets[pop] + t) % data_len];
     smem[tid] = (float)embedding[token * HIDDEN_DIM + tid];
-    __syncthreads();
+    block.sync();
     
-    float local_sum = fabsf(smem[tid]);
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2)
-        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
-    
-    if (tid % 32 == 0) warp_sums[tid / 32] = local_sum;
-    __syncthreads();
+    float warp_sum = cg::reduce(warp, fabsf(smem[tid]), cg::plus<float>());
+    if (warp.thread_rank() == 0) warp_sums[tid / 32] = warp_sum;
+    block.sync();
     
     if (tid == 0) {
         float sum = 0;
         for (int i = 0; i < 8; i++) sum += warp_sums[i];
-        if (sum == 0) sum = 1;
-        float mean = sum / HIDDEN_DIM;
-        if (mean == 0) mean = 1;
-        s_mean = mean;
+        s_mean = fmaxf(sum / HIDDEN_DIM, 1.0f);
     }
-    __syncthreads();
+    block.sync();
     
-    float val = smem[tid] * (float)ln_w[tid] / s_mean;
-    X[pop * HIDDEN_DIM + tid] = clip_f(val);
+    float val = clip_f(smem[tid] * (float)ln_w[tid] / s_mean);
+    X[pop * HIDDEN_DIM + tid] = val;
 }
 
-// Fused layer norm
+#ifdef USE_INT8_TC
+__global__ void __launch_bounds__(256)
+fused_embed_ln_quant_kernel(
+    const uint8_t* __restrict__ data,
+    long data_len,
+    const int8_t* __restrict__ embedding,
+    const int8_t* __restrict__ ln_w,
+    float* __restrict__ X,
+    int8_t* __restrict__ X_i8,
+    const long* __restrict__ offsets,
+    int t
+) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
+    int pop = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    __shared__ float smem[256];
+    __shared__ float s_mean;
+    __shared__ float warp_sums[8];
+    
+    uint8_t token = data[(offsets[pop] + t) % data_len];
+    smem[tid] = (float)embedding[token * HIDDEN_DIM + tid];
+    block.sync();
+    
+    float warp_sum = cg::reduce(warp, fabsf(smem[tid]), cg::plus<float>());
+    if (warp.thread_rank() == 0) warp_sums[tid / 32] = warp_sum;
+    block.sync();
+    
+    if (tid == 0) {
+        float sum = 0;
+        for (int i = 0; i < 8; i++) sum += warp_sums[i];
+        s_mean = fmaxf(sum / HIDDEN_DIM, 1.0f);
+    }
+    block.sync();
+    
+    float val = clip_f(smem[tid] * (float)ln_w[tid] / s_mean);
+    int idx = pop * HIDDEN_DIM + tid;
+    X[idx] = val;
+    X_i8[idx] = (int8_t)__float2int_rn(val);
+}
+
+__global__ void __launch_bounds__(256)
+fused_ln_quant_kernel(float* __restrict__ X, int8_t* __restrict__ X_i8, const int8_t* __restrict__ ln_w) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
+    int pop = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    float* x = X + pop * HIDDEN_DIM;
+    int8_t* x_i8 = X_i8 + pop * HIDDEN_DIM;
+    
+    __shared__ float s_mean;
+    __shared__ float warp_sums[8];
+    
+    float warp_sum = cg::reduce(warp, fabsf(x[tid]), cg::plus<float>());
+    if (warp.thread_rank() == 0) warp_sums[tid / 32] = warp_sum;
+    block.sync();
+    
+    if (tid == 0) {
+        float sum = 0;
+        for (int i = 0; i < 8; i++) sum += warp_sums[i];
+        s_mean = fmaxf(sum / HIDDEN_DIM, 1.0f);
+    }
+    block.sync();
+    
+    float val = clip_f(x[tid] * (float)ln_w[tid] / s_mean);
+    x[tid] = val;
+    x_i8[tid] = (int8_t)__float2int_rn(val);
+}
+#endif
+
 __global__ void __launch_bounds__(256)
 fused_ln_kernel(float* __restrict__ X, const int8_t* __restrict__ ln_w) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
     int pop = blockIdx.x;
     int tid = threadIdx.x;
     
@@ -137,42 +212,36 @@ fused_ln_kernel(float* __restrict__ X, const int8_t* __restrict__ ln_w) {
     __shared__ float s_mean;
     __shared__ float warp_sums[8];
     
-    float local_sum = fabsf(x[tid]);
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2)
-        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
-    
-    if (tid % 32 == 0) warp_sums[tid / 32] = local_sum;
-    __syncthreads();
+    float warp_sum = cg::reduce(warp, fabsf(x[tid]), cg::plus<float>());
+    if (warp.thread_rank() == 0) warp_sums[tid / 32] = warp_sum;
+    block.sync();
     
     if (tid == 0) {
         float sum = 0;
         for (int i = 0; i < 8; i++) sum += warp_sums[i];
-        if (sum == 0) sum = 1;
-        float mean = sum / HIDDEN_DIM;
-        if (mean == 0) mean = 1;
-        s_mean = mean;
+        s_mean = fmaxf(sum / HIDDEN_DIM, 1.0f);
     }
-    __syncthreads();
+    block.sync();
     
-    float val = x[tid] * (float)ln_w[tid] / s_mean;
-    x[tid] = clip_f(val);
+    x[tid] = clip_f(x[tid] * (float)ln_w[tid] / s_mean);
 }
 
 __global__ void __launch_bounds__(256)
 fused_perturbation_kernel(
-    float* __restrict__ out,      // [POPULATION_SIZE, out_dim]
-    const float* __restrict__ X,  // [POPULATION_SIZE, in_dim]
+    float* __restrict__ out,
+    const float* __restrict__ X,
     int out_dim,
     int in_dim,
     uint32_t seed
 ) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
     int pair = blockIdx.x;
     int tid = threadIdx.x;
     
     int pop_plus = pair * 2;
     int pop_minus = pair * 2 + 1;
-    
     uint32_t pair_seed = seed + pair;
     
     __shared__ float warp_sums_plus[8];
@@ -201,17 +270,14 @@ fused_perturbation_kernel(
         local_xB_minus += x_minus[i] * b;
     }
     
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        local_xB_plus += __shfl_down_sync(0xffffffff, local_xB_plus, offset);
-        local_xB_minus += __shfl_down_sync(0xffffffff, local_xB_minus, offset);
-    }
+    float warp_sum_plus = cg::reduce(warp, local_xB_plus, cg::plus<float>());
+    float warp_sum_minus = cg::reduce(warp, local_xB_minus, cg::plus<float>());
     
-    if (tid % 32 == 0) {
-        warp_sums_plus[tid / 32] = local_xB_plus;
-        warp_sums_minus[tid / 32] = local_xB_minus;
+    if (warp.thread_rank() == 0) {
+        warp_sums_plus[tid / 32] = warp_sum_plus;
+        warp_sums_minus[tid / 32] = warp_sum_minus;
     }
-    __syncthreads();
+    block.sync();
     
     if (tid == 0) {
         float sum_plus = 0, sum_minus = 0;
@@ -223,7 +289,7 @@ fused_perturbation_kernel(
         s_xB_plus = sum_plus;
         s_xB_minus = sum_minus;
     }
-    __syncthreads();
+    block.sync();
     
     float xB_plus = s_xB_plus;
     float xB_minus = s_xB_minus;
@@ -298,6 +364,43 @@ gru_ht_update_kernel(
     X[idx] = clip_f(h_new + residual[idx]);
 }
 
+#ifdef USE_INT8_TC
+__global__ void __launch_bounds__(256)
+gru_ht_update_quant_kernel(
+    const float* __restrict__ buf1,
+    const float* __restrict__ buf2,
+    const int8_t* __restrict__ bias,
+    const float* __restrict__ ft,
+    float* __restrict__ H,
+    int8_t* __restrict__ H_i8,
+    float* __restrict__ X,
+    const float* __restrict__ residual
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= POPULATION_SIZE * HIDDEN_DIM) return;
+    
+    int i = idx % HIDDEN_DIM;
+    float sum = buf1[idx] + buf2[idx] + (float)bias[i];
+    float ht = clip_f(ldexpf(sum, -8));
+    float h_old = H[idx];
+    float update = ((ft[idx] + 127.0f) * (ht - h_old)) / 256.0f;
+    float h_new = clip_f(h_old + update);
+    H[idx] = h_new;
+    H_i8[idx] = (int8_t)__float2int_rn(h_new);
+    X[idx] = clip_f(h_new + residual[idx]);
+}
+
+__global__ void __launch_bounds__(256)
+mlp_residual_quant_kernel(float* __restrict__ X, int8_t* __restrict__ X_i8, const float* __restrict__ residual, int shift) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= POPULATION_SIZE * HIDDEN_DIM) return;
+    
+    float val = clip_f(ldexpf(X[idx], -shift) + residual[idx]);
+    X[idx] = val;
+    X_i8[idx] = (int8_t)__float2int_rn(val);
+}
+#endif
+
 __global__ void __launch_bounds__(256)
 mlp_residual_kernel(float* __restrict__ X, const float* __restrict__ residual, int shift) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -307,7 +410,8 @@ mlp_residual_kernel(float* __restrict__ X, const float* __restrict__ residual, i
     X[idx] = clip_f(val + residual[idx]);
 }
 
-__global__ void copy_kernel(const float* src, float* dst, int n) {
+__global__ void __launch_bounds__(256)
+copy_kernel(const float* src, float* dst, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
 }
@@ -321,6 +425,9 @@ loss_kernel(
     int t,
     int32_t* __restrict__ losses
 ) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
     int pop = blockIdx.x;
     int tid = threadIdx.x;
     
@@ -337,12 +444,9 @@ loss_kernel(
         local_sum += d_EXP2_TABLE[idx];
     }
     
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2)
-        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
-    
-    if (tid % 32 == 0) warp_sums[tid / 32] = local_sum;
-    __syncthreads();
+    int32_t warp_sum = cg::reduce(warp, local_sum, cg::plus<int32_t>());
+    if (warp.thread_rank() == 0) warp_sums[tid / 32] = warp_sum;
+    block.sync();
     
     if (tid == 0) {
         int32_t sum_exp = 0;
@@ -379,7 +483,8 @@ update_weights_kernel(int8_t* W, int out_dim, int in_dim, uint32_t seed, const i
     else if (vote < -UPDATE_THRESHOLD && w > MIN_VAL) W[idx] = w - 1;
 }
 
-__global__ void int8_to_float_kernel(const int8_t* in, float* out, int n) {
+__global__ void __launch_bounds__(256)
+int8_to_float_kernel(const int8_t* in, float* out, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = (float)in[i];
 }
@@ -411,8 +516,7 @@ public:
     long data_len;
     
 #ifdef USE_INT8_TC
-    // INT8 tensor core buffers
-    int8_t *d_X_i8, *d_H_i8[N_LAYERS], *d_buf1_i8, *d_buf2_i8;
+    int8_t *d_X_i8, *d_H_i8[N_LAYERS], *d_buf1_i8, *d_buf2_i8, *d_logits_i8;
     int32_t *d_gemm_out;  // INT32 GEMM output buffer
 #endif
     
@@ -455,6 +559,7 @@ public:
         CUDA_CHECK(cudaMalloc(&d_X_i8, POPULATION_SIZE * MLP_EXPAND_DIM));
         CUDA_CHECK(cudaMalloc(&d_buf1_i8, POPULATION_SIZE * MLP_EXPAND_DIM));
         CUDA_CHECK(cudaMalloc(&d_buf2_i8, POPULATION_SIZE * HIDDEN_DIM));
+        CUDA_CHECK(cudaMalloc(&d_logits_i8, POPULATION_SIZE * VOCAB_SIZE));
         CUDA_CHECK(cudaMalloc(&d_gemm_out, POPULATION_SIZE * MLP_EXPAND_DIM * sizeof(int32_t)));
         for (int l = 0; l < N_LAYERS; l++)
             CUDA_CHECK(cudaMalloc(&d_H_i8[l], POPULATION_SIZE * HIDDEN_DIM));
@@ -478,7 +583,7 @@ public:
         cudaFree(d_offsets); cudaFree(d_fit); cudaFree(d_losses);
         if (d_data) cudaFree(d_data);
 #ifdef USE_INT8_TC
-        cudaFree(d_X_i8); cudaFree(d_buf1_i8); cudaFree(d_buf2_i8); cudaFree(d_gemm_out);
+        cudaFree(d_X_i8); cudaFree(d_buf1_i8); cudaFree(d_buf2_i8); cudaFree(d_logits_i8); cudaFree(d_gemm_out);
         for (int l = 0; l < N_LAYERS; l++) cudaFree(d_H_i8[l]);
 #endif
     }
@@ -513,6 +618,7 @@ public:
     }
     
 #ifdef USE_INT8_TC
+    // Original helper - quantize input, GEMM, dequantize output
     void int8_gemm_helper(
         float* out, const float* X, const int8_t* W,
         int batch, int out_dim, int in_dim,
@@ -524,6 +630,42 @@ public:
         quantize_kernel<<<(total_in + 255) / 256, 256>>>(X_i8_buf, X, total_in);
         int8_gemm_tn(gemm_buf, W, X_i8_buf, out_dim, batch, in_dim);
         dequantize_kernel<<<(total_out + 255) / 256, 256>>>(out, gemm_buf, total_out);
+    }
+    
+    void int8_gemm_fused_perturb(
+        float* out, const float* X, const int8_t* W,
+        int batch, int out_dim, int in_dim,
+        int8_t* X_i8_buf, int32_t* gemm_buf,
+        uint32_t seed
+    ) {
+        int total_in = batch * in_dim;
+        quantize_kernel<<<(total_in + 255) / 256, 256>>>(X_i8_buf, X, total_in);
+        int8_gemm_tn(gemm_buf, W, X_i8_buf, out_dim, batch, in_dim);
+        fused_dequant_perturb_kernel<<<PAIRS, 256>>>(out, gemm_buf, X_i8_buf, out_dim, in_dim, batch, seed);
+    }
+    
+    void int8_gemm_pure_i8(
+        int8_t* out_i8,
+        const int8_t* X_i8, const int8_t* W,
+        int batch, int out_dim, int in_dim,
+        int32_t* gemm_buf,
+        uint32_t seed,
+        int shift = 8
+    ) {
+        int8_gemm_tn(gemm_buf, W, X_i8, out_dim, batch, in_dim);
+        fused_i32_perturb_to_i8_kernel<<<PAIRS, 256>>>(out_i8, gemm_buf, X_i8, out_dim, in_dim, batch, seed, shift);
+    }
+    
+    void int8_gemm_to_float(
+        float* out_f32,
+        const int8_t* X_i8, const int8_t* W,
+        int batch, int out_dim, int in_dim,
+        int32_t* gemm_buf,
+        uint32_t seed,
+        int shift = 8
+    ) {
+        int8_gemm_tn(gemm_buf, W, X_i8, out_dim, batch, in_dim);
+        fused_dequant_perturb_kernel_f32<<<PAIRS, 256>>>(out_f32, gemm_buf, X_i8, out_dim, in_dim, batch, seed, shift);
     }
 #endif
     
@@ -538,8 +680,12 @@ public:
         }
         CUDA_CHECK(cudaMemcpy(d_offsets, h_offsets, POPULATION_SIZE * sizeof(long), cudaMemcpyHostToDevice));
         
-        for (int l = 0; l < N_LAYERS; l++)
+        for (int l = 0; l < N_LAYERS; l++) {
             CUDA_CHECK(cudaMemsetAsync(d_H[l], 0, POPULATION_SIZE * HIDDEN_DIM * sizeof(float)));
+#ifdef USE_INT8_TC
+            CUDA_CHECK(cudaMemsetAsync(d_H_i8[l], 0, POPULATION_SIZE * HIDDEN_DIM));
+#endif
+        }
         CUDA_CHECK(cudaMemsetAsync(d_losses, 0, POPULATION_SIZE * sizeof(int32_t)));
         
         int total_hd = POPULATION_SIZE * HIDDEN_DIM;
@@ -549,7 +695,11 @@ public:
         
         for (int t = 0; t < SEQ_LEN; t++) {
             const int8_t* ln_w0 = d_ln_w;
+#ifdef USE_INT8_TC
+            fused_embed_ln_quant_kernel<<<POPULATION_SIZE, HIDDEN_DIM>>>(d_data, data_len, d_emb, ln_w0, d_X, d_X_i8, d_offsets, t);
+#else
             fused_embed_ln_kernel<<<POPULATION_SIZE, HIDDEN_DIM>>>(d_data, data_len, d_emb, ln_w0, d_X, d_offsets, t);
+#endif
             
             for (int l = 0; l < N_LAYERS; l++) {
                 uint32_t l_seed = step_seed + l * 1000;
@@ -572,32 +722,21 @@ public:
                 const int8_t* mlp_w0 = d_mlp_w + l * 2 * HIDDEN_DIM * MLP_EXPAND_DIM;
                 const int8_t* mlp_w1 = mlp_w0 + HIDDEN_DIM * MLP_EXPAND_DIM;
                 
-                int8_gemm_helper(d_buf1, d_X, gru_w0, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_X_i8, d_gemm_out);
-                fused_perturbation_kernel<<<PAIRS, 256>>>(d_buf1, d_X, HIDDEN_DIM, HIDDEN_DIM, l_seed+1);
-                
-                int8_gemm_helper(d_buf2, d_H[l], gru_w1, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_X_i8, d_gemm_out);
-                fused_perturbation_kernel<<<PAIRS, 256>>>(d_buf2, d_H[l], HIDDEN_DIM, HIDDEN_DIM, l_seed+2);
-                
+                int8_gemm_to_float(d_buf1, d_X_i8, gru_w0, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_gemm_out, l_seed+1, 8);
+                int8_gemm_to_float(d_buf2, d_H_i8[l], gru_w1, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_gemm_out, l_seed+2, 8);
                 gru_gate_kernel<<<(total_hd+255)/256, 256>>>(d_buf1, d_buf2, bias_f, d_H[l], d_ft, d_gated_past);
                 
-                int8_gemm_helper(d_buf1, d_X, gru_w2, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_X_i8, d_gemm_out);
-                fused_perturbation_kernel<<<PAIRS, 256>>>(d_buf1, d_X, HIDDEN_DIM, HIDDEN_DIM, l_seed+3);
-                
-                int8_gemm_helper(d_buf2, d_gated_past, gru_w3, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_X_i8, d_gemm_out);
-                fused_perturbation_kernel<<<PAIRS, 256>>>(d_buf2, d_gated_past, HIDDEN_DIM, HIDDEN_DIM, l_seed+4);
-                
-                gru_ht_update_kernel<<<(total_hd+255)/256, 256>>>(d_buf1, d_buf2, bias_h, d_ft, d_H[l], d_X, d_residual);
+                int8_gemm_to_float(d_buf1, d_X_i8, gru_w2, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_gemm_out, l_seed+3, 8);
+                quantize_kernel<<<(total_hd + 255) / 256, 256>>>(d_buf2_i8, d_gated_past, total_hd);
+                int8_gemm_to_float(d_buf2, d_buf2_i8, gru_w3, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_gemm_out, l_seed+4, 8);
+                gru_ht_update_quant_kernel<<<(total_hd+255)/256, 256>>>(d_buf1, d_buf2, bias_h, d_ft, d_H[l], d_H_i8[l], d_X, d_residual);
                 
                 CUDA_CHECK(cudaMemcpyAsync(d_residual, d_X, total_hd * sizeof(float), cudaMemcpyDeviceToDevice));
-                fused_ln_kernel<<<POPULATION_SIZE, HIDDEN_DIM>>>(d_X, ln_w1);
+                fused_ln_quant_kernel<<<POPULATION_SIZE, HIDDEN_DIM>>>(d_X, d_X_i8, ln_w1);
                 
-                int8_gemm_helper(d_buf1, d_X, mlp_w0, POPULATION_SIZE, MLP_EXPAND_DIM, HIDDEN_DIM, d_X_i8, d_gemm_out);
-                fused_perturbation_kernel<<<PAIRS, 256>>>(d_buf1, d_X, MLP_EXPAND_DIM, HIDDEN_DIM, l_seed+5);
-                
-                int8_gemm_helper(d_X, d_buf1, mlp_w1, POPULATION_SIZE, HIDDEN_DIM, MLP_EXPAND_DIM, d_buf1_i8, d_gemm_out);
-                fused_perturbation_kernel<<<PAIRS, 256>>>(d_X, d_buf1, HIDDEN_DIM, MLP_EXPAND_DIM, l_seed+6);
-                
-                mlp_residual_kernel<<<(total_hd+255)/256, 256>>>(d_X, d_residual, 17);
+                int8_gemm_pure_i8(d_buf1_i8, d_X_i8, mlp_w0, POPULATION_SIZE, MLP_EXPAND_DIM, HIDDEN_DIM, d_gemm_out, l_seed+5, 8);
+                int8_gemm_to_float(d_X, d_buf1_i8, mlp_w1, POPULATION_SIZE, HIDDEN_DIM, MLP_EXPAND_DIM, d_gemm_out, l_seed+6, 8);
+                mlp_residual_quant_kernel<<<(total_hd+255)/256, 256>>>(d_X, d_X_i8, d_residual, 9);
 #else
                 CUBLAS_CHECK(cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                     HIDDEN_DIM, POPULATION_SIZE, HIDDEN_DIM, &alpha,
@@ -640,22 +779,21 @@ public:
 #endif
             }
             
-            // Output head
             fused_ln_kernel<<<POPULATION_SIZE, HIDDEN_DIM>>>(d_X, d_ln_out);
 #ifdef USE_INT8_TC
-            int8_gemm_helper(d_logits, d_X, d_head, POPULATION_SIZE, VOCAB_SIZE, HIDDEN_DIM,
-                             d_X_i8, d_gemm_out);
+            // Fused GEMM + perturbation for head
+            int8_gemm_fused_perturb(d_logits, d_X, d_head, POPULATION_SIZE, VOCAB_SIZE, HIDDEN_DIM,
+                                    d_X_i8, d_gemm_out, step_seed+999);
 #else
             CUBLAS_CHECK(cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                 VOCAB_SIZE, POPULATION_SIZE, HIDDEN_DIM, &alpha,
                 d_headf, HIDDEN_DIM, d_X, HIDDEN_DIM, &beta, d_logits, VOCAB_SIZE));
-#endif
             fused_perturbation_kernel<<<PAIRS, 256>>>(d_logits, d_X, VOCAB_SIZE, HIDDEN_DIM, step_seed+999);
+#endif
             
             loss_kernel<<<POPULATION_SIZE, 256>>>(d_logits, d_data, data_len, d_offsets, t, d_losses);
         }
         
-        // cudaMemcpy is synchronous, no need for explicit sync
         CUDA_CHECK(cudaMemcpy(h_loss, d_losses, POPULATION_SIZE * sizeof(int32_t), cudaMemcpyDeviceToHost));
         
         for (int p = 0; p < PAIRS; p++) {
@@ -664,7 +802,7 @@ public:
             else h_fit[p] = 0;
         }
         
-        // Check if any fitness is non-zero (skip update if all ties)
+        // Check if any fitness is non-zero
         bool any_nonzero = false;
         for (int p = 0; p < PAIRS; p++) {
             if (h_fit[p] != 0) { any_nonzero = true; break; }

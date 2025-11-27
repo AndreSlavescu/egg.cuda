@@ -4,6 +4,7 @@ set -e
 VERBOSE=""
 CUTLASS_OPT=""
 INT8_TC=""
+LOCK_CLOCKS=""
 MAKE_ARGS=""
 
 while [[ $# -gt 0 ]]; do
@@ -23,6 +24,10 @@ while [[ $# -gt 0 ]]; do
             MAKE_ARGS="$MAKE_ARGS INT8_TC=1"
             shift
             ;;
+        --lock-clocks)
+            LOCK_CLOCKS=1
+            shift
+            ;;
         --arch=*)
             MAKE_ARGS="$MAKE_ARGS FORCE_ARCH=${1#*=}"
             shift
@@ -32,8 +37,9 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  -v, --verbose    Enable verbose PTXAS output (register usage, spills)"
-            echo "  --cutlass        Enable experimental cutlass kernel naming optimization"
+            echo "  --cutlass-rename Enable experimental cutlass kernel naming optimization"
             echo "  --int8           Use INT8 tensor cores instead of FP32 cuBLAS (H100 only)"
+            echo "  --lock-clocks    Lock GPU clocks at max frequency (reduces thermal throttling)"
             echo "  --arch=SM        Force specific architecture (e.g., --arch=sm_90a)"
             echo "  -h, --help       Show this help message"
             echo ""
@@ -41,7 +47,7 @@ while [[ $# -gt 0 ]]; do
             echo "  $0                    # Normal build and run (FP32 cuBLAS)"
             echo "  $0 -v                 # Build with verbose PTXAS output"
             echo "  $0 --int8             # Use INT8 tensor cores (H100)"
-            echo "  $0 --int8 -v          # INT8 with verbose output"
+            echo "  $0 --int8 --lock-clocks  # INT8 with locked clocks"
             exit 0
             ;;
         *)
@@ -86,6 +92,30 @@ fi
 
 make clean
 make $MAKE_ARGS
+
+if [ -n "$LOCK_CLOCKS" ]; then
+    echo ""
+    echo "Locking GPU clocks at max frequency..."
+    
+    MAX_GR_CLOCK=$(nvidia-smi -q -d SUPPORTED_CLOCKS | grep -A1 "Graphics" | tail -1 | awk '{print $3}')
+    MAX_MEM_CLOCK=$(nvidia-smi -q -d SUPPORTED_CLOCKS | grep "Memory" | head -1 | awk '{print $3}')
+    
+    if [ -n "$MAX_GR_CLOCK" ]; then
+        sudo nvidia-smi -lgc $MAX_GR_CLOCK,$MAX_GR_CLOCK 2>/dev/null || \
+            echo "Warning: Could not lock graphics clocks (need sudo?)"
+    fi
+    
+    sudo nvidia-smi -pm 1 2>/dev/null || true
+    
+    echo "GPU clocks locked at ${MAX_GR_CLOCK} MHz"
+    
+    cleanup() {
+        echo ""
+        echo "Resetting GPU clocks..."
+        sudo nvidia-smi -rgc 2>/dev/null || true
+    }
+    trap cleanup EXIT
+fi
 
 echo ""
 echo "Running training..."

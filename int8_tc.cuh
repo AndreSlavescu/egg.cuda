@@ -3,8 +3,12 @@
 
 #include <cuda_runtime.h>
 #include <cublasLt.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include <stdio.h>
 #include <unordered_map>
+
+namespace cg = cooperative_groups;
 
 struct GemmKey {
     int M, N, K;
@@ -96,17 +100,253 @@ inline void int8_gemm_tn(int32_t* C, const int8_t* W, const int8_t* X, int N, in
     get_cublaslt_int8()->gemm_tn(C, W, X, N, M, K, stream);
 }
 
-__global__ void quantize_kernel(int8_t* out, const float* in, int n) {
+__global__ void __launch_bounds__(256, 4)
+quantize_kernel(int8_t* __restrict__ out, const float* __restrict__ in, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        float val = fminf(fmaxf(in[i], -127.0f), 127.0f);
-        out[i] = (int8_t)__float2int_rn(val);
+        out[i] = (int8_t)__float2int_rn(fminf(fmaxf(in[i], -127.0f), 127.0f));
     }
 }
 
-__global__ void dequantize_kernel(float* out, const int32_t* in, int n) {
+__global__ void __launch_bounds__(256, 4)
+dequantize_kernel(float* __restrict__ out, const int32_t* __restrict__ in, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = (float)in[i];
+}
+
+__device__ __forceinline__ uint32_t perturb_hash_rng(uint32_t seed, uint32_t idx) {
+    uint32_t x = seed + idx * 0x9e3779b9;
+    x ^= x >> 16; x *= 0x85ebca6b; x ^= x >> 13; x *= 0xc2b2ae35; x ^= x >> 16;
+    return x;
+}
+
+__device__ __forceinline__ int8_t perturb_gen_noise(uint32_t seed, uint32_t idx) {
+    uint32_t r = perturb_hash_rng(seed, idx);
+    return (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 31));
+}
+
+__global__ void __launch_bounds__(256, 2)
+fused_dequant_perturb_kernel(
+    float* __restrict__ out,
+    const int32_t* __restrict__ gemm_out,
+    const int8_t* __restrict__ X_i8,
+    int out_dim,
+    int in_dim,
+    int population_size,
+    uint32_t seed
+) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
+    int pair = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    int pop_plus = pair * 2;
+    int pop_minus = pair * 2 + 1;
+    uint32_t pair_seed = seed + pair;
+    
+    __shared__ float warp_sums_plus[8];
+    __shared__ float warp_sums_minus[8];
+    __shared__ float s_xB_plus, s_xB_minus;
+    
+    const int8_t* x_plus = X_i8 + pop_plus * in_dim;
+    const int8_t* x_minus = X_i8 + pop_minus * in_dim;
+    
+    float local_xB_plus = 0, local_xB_minus = 0;
+    for (int i = tid; i < in_dim; i += blockDim.x) {
+        float b = (float)perturb_gen_noise(pair_seed, out_dim + i);
+        local_xB_plus += (float)x_plus[i] * b;
+        local_xB_minus += (float)x_minus[i] * b;
+    }
+    
+    float warp_sum_plus = cg::reduce(warp, local_xB_plus, cg::plus<float>());
+    float warp_sum_minus = cg::reduce(warp, local_xB_minus, cg::plus<float>());
+    
+    if (warp.thread_rank() == 0) {
+        warp_sums_plus[tid / 32] = warp_sum_plus;
+        warp_sums_minus[tid / 32] = warp_sum_minus;
+    }
+    block.sync();
+    
+    if (tid == 0) {
+        float sum_plus = 0, sum_minus = 0;
+        #pragma unroll 8
+        for (int i = 0; i < 8; i++) {
+            sum_plus += warp_sums_plus[i];
+            sum_minus += warp_sums_minus[i];
+        }
+        s_xB_plus = sum_plus;
+        s_xB_minus = sum_minus;
+    }
+    block.sync();
+    
+    float xB_plus = s_xB_plus;
+    float xB_minus = s_xB_minus;
+    float scale = 1.0f / 256.0f;
+    
+    const int32_t* gemm_plus = gemm_out + pop_plus * out_dim;
+    const int32_t* gemm_minus = gemm_out + pop_minus * out_dim;
+    float* out_plus = out + pop_plus * out_dim;
+    float* out_minus = out + pop_minus * out_dim;
+    
+    for (int r = tid; r < out_dim; r += blockDim.x) {
+        float a = (float)perturb_gen_noise(pair_seed, r) * scale;
+        out_plus[r] = (float)gemm_plus[r] + xB_plus * a;
+        out_minus[r] = (float)gemm_minus[r] - xB_minus * a;
+    }
+}
+
+__global__ void __launch_bounds__(256, 2)
+fused_i32_perturb_to_i8_kernel(
+    int8_t* __restrict__ out_i8,
+    const int32_t* __restrict__ gemm_out,
+    const int8_t* __restrict__ X_i8,
+    int out_dim,
+    int in_dim,
+    int population_size,
+    uint32_t seed,
+    int shift
+) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
+    int pair = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    int pop_plus = pair * 2;
+    int pop_minus = pair * 2 + 1;
+    uint32_t pair_seed = seed + pair;
+    
+    __shared__ int warp_sums_plus[8];
+    __shared__ int warp_sums_minus[8];
+    __shared__ int s_xB_plus, s_xB_minus;
+    
+    const int8_t* x_plus = X_i8 + pop_plus * in_dim;
+    const int8_t* x_minus = X_i8 + pop_minus * in_dim;
+    
+    int local_xB_plus = 0, local_xB_minus = 0;
+    for (int i = tid; i < in_dim; i += blockDim.x) {
+        int b = (int)perturb_gen_noise(pair_seed, out_dim + i);
+        local_xB_plus += (int)x_plus[i] * b;
+        local_xB_minus += (int)x_minus[i] * b;
+    }
+    
+    int warp_sum_plus = cg::reduce(warp, local_xB_plus, cg::plus<int>());
+    int warp_sum_minus = cg::reduce(warp, local_xB_minus, cg::plus<int>());
+    
+    if (warp.thread_rank() == 0) {
+        warp_sums_plus[tid / 32] = warp_sum_plus;
+        warp_sums_minus[tid / 32] = warp_sum_minus;
+    }
+    block.sync();
+    
+    if (tid == 0) {
+        int sum_plus = 0, sum_minus = 0;
+        #pragma unroll 8
+        for (int i = 0; i < 8; i++) {
+            sum_plus += warp_sums_plus[i];
+            sum_minus += warp_sums_minus[i];
+        }
+        s_xB_plus = sum_plus;
+        s_xB_minus = sum_minus;
+    }
+    block.sync();
+    
+    int xB_plus = s_xB_plus;
+    int xB_minus = s_xB_minus;
+    
+    const int32_t* gemm_plus = gemm_out + pop_plus * out_dim;
+    const int32_t* gemm_minus = gemm_out + pop_minus * out_dim;
+    int8_t* out_i8_plus = out_i8 + pop_plus * out_dim;
+    int8_t* out_i8_minus = out_i8 + pop_minus * out_dim;
+    
+    for (int r = tid; r < out_dim; r += blockDim.x) {
+        int a = (int)perturb_gen_noise(pair_seed, r);
+        int perturb_plus = (xB_plus * a) >> 8;
+        int perturb_minus = (xB_minus * a) >> 8;
+        
+        int val_plus = (gemm_plus[r] >> shift) + perturb_plus;
+        int val_minus = (gemm_minus[r] >> shift) - perturb_minus;
+        
+        val_plus = max(-127, min(127, val_plus));
+        val_minus = max(-127, min(127, val_minus));
+        
+        out_i8_plus[r] = (int8_t)val_plus;
+        out_i8_minus[r] = (int8_t)val_minus;
+    }
+}
+
+__global__ void __launch_bounds__(256, 2)
+fused_dequant_perturb_kernel_f32(
+    float* __restrict__ out_f32,
+    const int32_t* __restrict__ gemm_out,
+    const int8_t* __restrict__ X_i8,
+    int out_dim,
+    int in_dim,
+    int population_size,
+    uint32_t seed,
+    int shift
+) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
+    int pair = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    int pop_plus = pair * 2;
+    int pop_minus = pair * 2 + 1;
+    uint32_t pair_seed = seed + pair;
+    
+    __shared__ float warp_sums_plus[8];
+    __shared__ float warp_sums_minus[8];
+    __shared__ float s_xB_plus, s_xB_minus;
+    
+    const int8_t* x_plus = X_i8 + pop_plus * in_dim;
+    const int8_t* x_minus = X_i8 + pop_minus * in_dim;
+    
+    float local_xB_plus = 0, local_xB_minus = 0;
+    for (int i = tid; i < in_dim; i += blockDim.x) {
+        float b = (float)perturb_gen_noise(pair_seed, out_dim + i);
+        local_xB_plus += (float)x_plus[i] * b;
+        local_xB_minus += (float)x_minus[i] * b;
+    }
+    
+    float warp_sum_plus = cg::reduce(warp, local_xB_plus, cg::plus<float>());
+    float warp_sum_minus = cg::reduce(warp, local_xB_minus, cg::plus<float>());
+    
+    if (warp.thread_rank() == 0) {
+        warp_sums_plus[tid / 32] = warp_sum_plus;
+        warp_sums_minus[tid / 32] = warp_sum_minus;
+    }
+    block.sync();
+    
+    if (tid == 0) {
+        float sum_plus = 0, sum_minus = 0;
+        #pragma unroll 8
+        for (int i = 0; i < 8; i++) {
+            sum_plus += warp_sums_plus[i];
+            sum_minus += warp_sums_minus[i];
+        }
+        s_xB_plus = sum_plus;
+        s_xB_minus = sum_minus;
+    }
+    block.sync();
+    
+    float xB_plus = s_xB_plus;
+    float xB_minus = s_xB_minus;
+    float perturb_scale = 1.0f / 256.0f;
+    float dequant_scale = ldexpf(1.0f, -shift);
+    
+    const int32_t* gemm_plus = gemm_out + pop_plus * out_dim;
+    const int32_t* gemm_minus = gemm_out + pop_minus * out_dim;
+    float* out_f_plus = out_f32 + pop_plus * out_dim;
+    float* out_f_minus = out_f32 + pop_minus * out_dim;
+    
+    for (int r = tid; r < out_dim; r += blockDim.x) {
+        float a = (float)perturb_gen_noise(pair_seed, r) * perturb_scale;
+        out_f_plus[r] = (float)gemm_plus[r] * dequant_scale + xB_plus * a;
+        out_f_minus[r] = (float)gemm_minus[r] * dequant_scale - xB_minus * a;
+    }
 }
 
 inline void print_int8_tc_info() {
