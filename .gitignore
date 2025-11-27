@@ -2,6 +2,7 @@ input.txt
 wikigen/wikitext_combined.txt
 wikigen/*.txt
 wikigen/cache/
+full_cuda_train_egg
 
 egg_gpu
 egg_cpu

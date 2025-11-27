@@ -17,12 +17,51 @@ namespace cg = cooperative_groups;
 
 #define VOCAB_SIZE 256
 #define HIDDEN_DIM 256
-#define N_LAYERS 6
+#define N_LAYERS 4
 #define SEQ_LEN 100
-#define POPULATION_SIZE 1024
+#define POPULATION_SIZE (2 << 14)
 #define FIXED_POINT 4
 #define SIGMA_SHIFT 4
-#define UPDATE_THRESHOLD 160
+
+struct ThresholdController {
+    float threshold;
+    float prev_loss;
+    float ema_loss_delta;
+    int stagnant_count;
+    
+    void init() {
+        threshold = 1000.0f * (POPULATION_SIZE / 32768.0f);
+        prev_loss = 100.0f;
+        ema_loss_delta = 0.0f;
+        stagnant_count = 0;
+    }
+    
+    int get_threshold(float current_loss) {
+        float loss_delta = prev_loss - current_loss;
+        ema_loss_delta = 0.9f * ema_loss_delta + 0.1f * loss_delta;
+        
+        if (ema_loss_delta > 0.01f) {
+            threshold *= 0.98f;
+            stagnant_count = 0;
+        } else if (ema_loss_delta < 0.001f) {
+            stagnant_count++;
+            if (stagnant_count > 5) {
+                threshold *= 0.9f;
+                stagnant_count = 0;
+            }
+        } else if (ema_loss_delta < -0.01f) {
+            threshold *= 1.1f;
+        }
+        
+        float base = POPULATION_SIZE / 32768.0f;
+        threshold = fmaxf(threshold, 100.0f * base);
+        threshold = fminf(threshold, 500000.0f * base);
+        
+        prev_loss = current_loss;
+        return (int)threshold;
+    }
+};
+
 #define MAX_VAL 127
 #define MIN_VAL -127
 #define MLP_EXPAND_DIM (HIDDEN_DIM * 4)
@@ -459,7 +498,7 @@ loss_kernel(
 }
 
 __global__ void __launch_bounds__(256)
-update_weights_kernel(int8_t* W, int out_dim, int in_dim, uint32_t seed, const int* __restrict__ fitnesses, int pairs) {
+update_weights_kernel(int8_t* W, int out_dim, int in_dim, uint32_t seed, const int* __restrict__ fitnesses, int pairs, int threshold) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= out_dim * in_dim) return;
     
@@ -479,8 +518,28 @@ update_weights_kernel(int8_t* W, int out_dim, int in_dim, uint32_t seed, const i
     }
     
     int8_t w = W[idx];
-    if (vote > UPDATE_THRESHOLD && w < MAX_VAL) W[idx] = w + 1;
-    else if (vote < -UPDATE_THRESHOLD && w > MIN_VAL) W[idx] = w - 1;
+    if (vote > threshold && w < MAX_VAL) W[idx] = w + 1;
+    else if (vote < -threshold && w > MIN_VAL) W[idx] = w - 1;
+}
+
+__global__ void __launch_bounds__(256)
+update_vector_kernel(int8_t* V, int len, uint32_t seed, const int* __restrict__ fitnesses, int pairs, int threshold) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) return;
+    
+    int32_t vote = 0;
+    for (int p = 0; p < pairs; p++) {
+        int f = fitnesses[p];
+        if (f == 0) continue;
+        
+        uint32_t pair_seed = seed + p;
+        int8_t a = gen_noise_hash(pair_seed, idx);
+        vote += (int32_t)a * f;
+    }
+    
+    int8_t v = V[idx];
+    if (vote > threshold && v < MAX_VAL) V[idx] = v + 1;
+    else if (vote < -threshold && v > MIN_VAL) V[idx] = v - 1;
 }
 
 __global__ void __launch_bounds__(256)
@@ -503,6 +562,7 @@ struct EggModel {
 class Trainer {
 public:
     cublasHandle_t cublas;
+    ThresholdController threshold_ctrl;
     
     int8_t *d_emb, *d_gru_w, *d_gru_b, *d_mlp_w, *d_head, *d_ln_w, *d_ln_out;
     float *d_gru_wf[N_LAYERS][4], *d_mlp_wf[N_LAYERS][2], *d_headf;
@@ -523,6 +583,7 @@ public:
     Trainer() {
         CUBLAS_CHECK(cublasCreate(&cublas));
         CUBLAS_CHECK(cublasSetMathMode(cublas, CUBLAS_TF32_TENSOR_OP_MATH));
+        threshold_ctrl.init();
         
         CUDA_CHECK(cudaMalloc(&d_emb, VOCAB_SIZE * HIDDEN_DIM));
         CUDA_CHECK(cudaMalloc(&d_gru_w, N_LAYERS * 4 * HIDDEN_DIM * HIDDEN_DIM));
@@ -796,19 +857,23 @@ public:
         
         CUDA_CHECK(cudaMemcpy(h_loss, d_losses, POPULATION_SIZE * sizeof(int32_t), cudaMemcpyDeviceToHost));
         
+        long long total_loss = 0;
+        for (int p = 0; p < POPULATION_SIZE; p++) total_loss += h_loss[p];
+        float avg_loss = (float)total_loss / POPULATION_SIZE / (SEQ_LEN * (1 << FIXED_POINT));
+        int threshold = threshold_ctrl.get_threshold(avg_loss);
+        
         for (int p = 0; p < PAIRS; p++) {
             if (h_loss[p*2] < h_loss[p*2+1]) h_fit[p] = 1;
             else if (h_loss[p*2+1] < h_loss[p*2]) h_fit[p] = -1;
             else h_fit[p] = 0;
         }
         
-        // Check if any fitness is non-zero
         bool any_nonzero = false;
         for (int p = 0; p < PAIRS; p++) {
             if (h_fit[p] != 0) { any_nonzero = true; break; }
         }
         
-        if (!any_nonzero) return;  // Skip weight updates if all ties
+        if (!any_nonzero) return;
         
         CUDA_CHECK(cudaMemcpy(d_fit, h_fit, PAIRS * sizeof(int), cudaMemcpyHostToDevice));
         
@@ -816,22 +881,34 @@ public:
             uint32_t l_seed = step_seed + l * 1000;
             for (int w = 0; w < 4; w++) {
                 int8_t* gru_w = d_gru_w + l * 4 * HIDDEN_DIM * HIDDEN_DIM + w * HIDDEN_DIM * HIDDEN_DIM;
-                // GRU: out_dim=HIDDEN_DIM, in_dim=HIDDEN_DIM
                 update_weights_kernel<<<(HIDDEN_DIM*HIDDEN_DIM+255)/256, 256>>>(
-                    gru_w, HIDDEN_DIM, HIDDEN_DIM, l_seed+1+w, d_fit, PAIRS);
+                    gru_w, HIDDEN_DIM, HIDDEN_DIM, l_seed+1+w, d_fit, PAIRS, threshold);
             }
             int8_t* mlp_w0 = d_mlp_w + l * 2 * HIDDEN_DIM * MLP_EXPAND_DIM;
             int8_t* mlp_w1 = mlp_w0 + HIDDEN_DIM * MLP_EXPAND_DIM;
-            // MLP expand: out_dim=MLP_EXPAND_DIM, in_dim=HIDDEN_DIM
             update_weights_kernel<<<(MLP_EXPAND_DIM*HIDDEN_DIM+255)/256, 256>>>(
-                mlp_w0, MLP_EXPAND_DIM, HIDDEN_DIM, l_seed+5, d_fit, PAIRS);
-            // MLP project: out_dim=HIDDEN_DIM, in_dim=MLP_EXPAND_DIM
+                mlp_w0, MLP_EXPAND_DIM, HIDDEN_DIM, l_seed+5, d_fit, PAIRS, threshold);
             update_weights_kernel<<<(HIDDEN_DIM*MLP_EXPAND_DIM+255)/256, 256>>>(
-                mlp_w1, HIDDEN_DIM, MLP_EXPAND_DIM, l_seed+6, d_fit, PAIRS);
+                mlp_w1, HIDDEN_DIM, MLP_EXPAND_DIM, l_seed+6, d_fit, PAIRS, threshold);
         }
-        // Head: out_dim=VOCAB_SIZE, in_dim=HIDDEN_DIM
         update_weights_kernel<<<(VOCAB_SIZE*HIDDEN_DIM+255)/256, 256>>>(
-            d_head, VOCAB_SIZE, HIDDEN_DIM, step_seed+999, d_fit, PAIRS);
+            d_head, VOCAB_SIZE, HIDDEN_DIM, step_seed+999, d_fit, PAIRS, threshold);
+        
+        // Update embedding
+        update_weights_kernel<<<(VOCAB_SIZE*HIDDEN_DIM+255)/256, 256>>>(
+            d_emb, HIDDEN_DIM, VOCAB_SIZE, step_seed+888, d_fit, PAIRS, threshold);
+        
+        // Update layer norm weights and GRU biases
+        for (int l = 0; l < N_LAYERS; l++) {
+            uint32_t l_seed = step_seed + l * 1000;
+            int8_t* ln_w = d_ln_w + l * 2 * HIDDEN_DIM;
+            int8_t* gru_b = d_gru_b + l * 2 * HIDDEN_DIM;
+            update_vector_kernel<<<(HIDDEN_DIM+255)/256, 256>>>(ln_w, HIDDEN_DIM, l_seed+10, d_fit, PAIRS, threshold);
+            update_vector_kernel<<<(HIDDEN_DIM+255)/256, 256>>>(ln_w + HIDDEN_DIM, HIDDEN_DIM, l_seed+11, d_fit, PAIRS, threshold);
+            update_vector_kernel<<<(HIDDEN_DIM+255)/256, 256>>>(gru_b, HIDDEN_DIM, l_seed+20, d_fit, PAIRS, threshold);
+            update_vector_kernel<<<(HIDDEN_DIM+255)/256, 256>>>(gru_b + HIDDEN_DIM, HIDDEN_DIM, l_seed+21, d_fit, PAIRS, threshold);
+        }
+        update_vector_kernel<<<(HIDDEN_DIM+255)/256, 256>>>(d_ln_out, HIDDEN_DIM, step_seed+777, d_fit, PAIRS, threshold);
         
         for (int l = 0; l < N_LAYERS; l++) {
             for (int w = 0; w < 4; w++) {
@@ -934,7 +1011,7 @@ int main() {
         clock_gettime(CLOCK_MONOTONIC, &s1);
         double ms = (s1.tv_sec - s0.tv_sec) * 1000.0 + (s1.tv_nsec - s0.tv_nsec) / 1e6;
         
-        int32_t avg_loss = 0;
+        int64_t avg_loss = 0;
         for (int i = 0; i < POPULATION_SIZE; i++) avg_loss += loss[i];
         avg_loss /= POPULATION_SIZE;
         float loss_val = (float)avg_loss / (SEQ_LEN * 16.0f);
@@ -951,8 +1028,8 @@ int main() {
             printf("%c", (c >= 32 && c <= 126) ? c : '.');
         }
         printf("\033[36m..............................\033[0m\n");
-        printf("Step %ld | Loss: %.4f | +Perturb Lower Loss: %d | -Perturb Lower Loss: %d | %.1f ms\n",
-               step, loss_val, pos_better, neg_better, ms);
+        printf("Step %ld | Loss: %.4f | Thr: %.0f | +: %d | -: %d | %.1f ms\n",
+               step, loss_val, tr.threshold_ctrl.threshold, pos_better, neg_better, ms);
         fflush(stdout);
     }
     
