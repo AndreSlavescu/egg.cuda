@@ -62,7 +62,7 @@ if [ ! -f "input.txt" ]; then
     echo "Preparing dataset..."
     if [ ! -f "wikigen/wikitext_combined.txt" ]; then
         cd wikigen
-        python convert_wikitext.py
+        python3 convert_wikitext.py
         cd ..
     fi
     ln -sf wikigen/wikitext_combined.txt input.txt
