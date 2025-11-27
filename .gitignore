@@ -11,3 +11,5 @@ egg_cpu
 __pycache__/
 *.pyc
 .cache/
+
+.env

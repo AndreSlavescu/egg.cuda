@@ -71,7 +71,14 @@ else
     echo "Dataset already exists: $(du -h input.txt | cut -f1)"
 fi
 
-export PATH=/usr/local/cuda-12.8/bin:$PATH
+if ! command -v nvcc >/dev/null 2>&1; then
+    for cuda_path in /usr/local/cuda/bin /usr/local/cuda-13.0/bin /usr/local/cuda-12.8/bin; do
+        if [ -x "$cuda_path/nvcc" ]; then
+            export PATH="$cuda_path:$PATH"
+            break
+        fi
+    done
+fi
 
 if ! command -v nvcc >/dev/null 2>&1; then
     echo "nvcc not found in PATH; please install CUDA toolkit."

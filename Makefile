@@ -2,10 +2,13 @@ NVCC ?= /usr/local/cuda-12.8/bin/nvcc
 NVCCFLAGS = -O3 -use_fast_math --expt-relaxed-constexpr
 LDFLAGS = -lcublas -lcublasLt
 
-# Check for sm_90/90a
+B200_CHECK := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | grep -q "10.0" && echo yes)
 H100_CHECK := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | grep -q "9.0" && echo yes)
 
-ifeq ($(H100_CHECK),yes)
+ifeq ($(B200_CHECK),yes)
+    ARCH = -arch=sm_100
+    IS_H100 = 1
+else ifeq ($(H100_CHECK),yes)
     ARCH = -arch=sm_90a
     IS_H100 = 1
 else
