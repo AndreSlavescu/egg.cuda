@@ -105,15 +105,6 @@ __device__ __forceinline__ int8_t gen_noise_hash(uint32_t seed, uint32_t idx) {
     return (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 31));
 }
 
-// Original xorshift for compatibility with weight updates
-__device__ __forceinline__ uint32_t xorshift32(uint32_t x) {
-    x ^= x << 13; x ^= x >> 17; x ^= x << 5; return x;
-}
-
-__device__ __forceinline__ int8_t gen_noise(uint32_t r) {
-    return (int8_t)((r & 1 ? 1 : -1) * ((r >> 1) & 31));
-}
-
 __device__ __forceinline__ int get_msb(uint32_t n) {
     return 31 - __clz(n | 1);
 }
