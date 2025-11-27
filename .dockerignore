@@ -5,7 +5,8 @@ full_cuda_train_egg
 .gitignore
 _imgs_/
 README.md
-wikigen/
+wikigen/*.txt
+wikigen/cache/
 .vscode/
 .idea/
 .env

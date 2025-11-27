@@ -8,7 +8,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server \
     curl \
     git \
-    && rm -rf /var/lib/apt/lists/*
+    python3 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --break-system-packages datasets
 
 RUN mkdir -p /var/run/sshd /root/.ssh && \
     chmod 700 /root/.ssh
@@ -35,7 +38,7 @@ COPY int8_tc.cuh .
 COPY Makefile .
 COPY scripts/ ./scripts/
 COPY train_gpu.sh .
-COPY input.txt .
+COPY wikigen/convert_wikitext.py ./wikigen/
 
 RUN chmod +x train_gpu.sh
 
