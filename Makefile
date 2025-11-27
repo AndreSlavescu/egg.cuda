@@ -1,4 +1,8 @@
-NVCC ?= /usr/local/cuda-12.8/bin/nvcc
+NVCC ?= $(shell which nvcc 2>/dev/null || \
+    ls /usr/local/cuda-13.0/bin/nvcc 2>/dev/null || \
+    ls /usr/local/cuda-12.8/bin/nvcc 2>/dev/null || \
+    ls /usr/local/cuda/bin/nvcc 2>/dev/null || \
+    echo "nvcc")
 NVCCFLAGS = -O3 -use_fast_math --expt-relaxed-constexpr
 LDFLAGS = -lcublas -lcublasLt
 
