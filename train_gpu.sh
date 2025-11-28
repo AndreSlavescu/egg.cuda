@@ -5,6 +5,7 @@ VERBOSE=""
 CUTLASS_OPT=""
 INT8_TC=""
 LOCK_CLOCKS=""
+DISTRIBUTED=""
 MAKE_ARGS=""
 
 while [[ $# -gt 0 ]]; do
@@ -32,22 +33,29 @@ while [[ $# -gt 0 ]]; do
             MAKE_ARGS="$MAKE_ARGS FORCE_ARCH=${1#*=}"
             shift
             ;;
+        --distributed)
+            DISTRIBUTED=1
+            MAKE_ARGS="$MAKE_ARGS USE_DISTRIBUTED=1 B200_OPTIMIZATIONS=1"
+            shift
+            ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
             echo "  -v, --verbose    Enable verbose PTXAS output (register usage, spills)"
             echo "  --cutlass-rename Enable experimental cutlass kernel naming optimization"
-            echo "  --int8           Use INT8 tensor cores instead of FP32 cuBLAS (H100 only)"
+            echo "  --int8           Use INT8 tensor cores instead of FP32 cuBLAS (H100/B200)"
             echo "  --lock-clocks    Lock GPU clocks at max frequency (reduces thermal throttling)"
             echo "  --arch=SM        Force specific architecture (e.g., --arch=sm_90a)"
+            echo "  --distributed    Enable distributed multi-GPU training (8xB200)"
             echo "  -h, --help       Show this help message"
             echo ""
             echo "Examples:"
             echo "  $0                    # Normal build and run (FP32 cuBLAS)"
             echo "  $0 -v                 # Build with verbose PTXAS output"
-            echo "  $0 --int8             # Use INT8 tensor cores (H100)"
+            echo "  $0 --int8             # Use INT8 tensor cores (H100/B200)"
             echo "  $0 --int8 --lock-clocks  # INT8 with locked clocks"
+            echo "  $0 --distributed --int8  # Distributed INT8 training on 8xB200"
             exit 0
             ;;
         *)
@@ -72,7 +80,7 @@ else
 fi
 
 if ! command -v nvcc >/dev/null 2>&1; then
-    for cuda_path in /usr/local/cuda/bin /usr/local/cuda-13.0/bin /usr/local/cuda-12.8/bin; do
+    for cuda_path in /usr/local/cuda-13.0/bin /usr/local/cuda-12.8/bin /usr/local/cuda/bin; do
         if [ -x "$cuda_path/nvcc" ]; then
             export PATH="$cuda_path:$PATH"
             break
@@ -86,7 +94,7 @@ if ! command -v nvcc >/dev/null 2>&1; then
 fi
 
 echo ""
-echo "Compiling CUDA code (full_trained_egg.cu)..."
+echo "Compiling CUDA code (csrc/full_trained_egg.cu)..."
 if [ -n "$VERBOSE" ]; then
     echo "Verbose PTXAS enabled - showing register usage"
 fi
@@ -94,7 +102,10 @@ if [ -n "$CUTLASS_OPT" ]; then
     echo "Cutlass kernel naming optimization enabled"
 fi
 if [ -n "$INT8_TC" ]; then
-    echo "INT8 Tensor Core mode enabled (WGMMA on H100)"
+    echo "INT8 Training"
+fi
+if [ -n "$DISTRIBUTED" ]; then
+    echo "Distributed multi-GPU mode enabled with synchronized training"
 fi
 
 make clean

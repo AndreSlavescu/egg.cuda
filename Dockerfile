@@ -33,8 +33,9 @@ RUN echo 'PS1="\[\033[1;36m\]egg-cuda\[\033[0m\]:\[\033[1;34m\]\w\[\033[0m\]\$ "
 
 WORKDIR /app
 
-COPY full_trained_egg.cu .
-COPY int8_tc.cuh .
+COPY csrc/ ./csrc/
+COPY include/ ./include/
+COPY full_cuda_train_egg.cu .
 COPY Makefile .
 COPY scripts/ ./scripts/
 COPY train_gpu.sh .
