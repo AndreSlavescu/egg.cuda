@@ -21,6 +21,8 @@
 #include "distributed_b200.cuh"
 #endif
 
+#include "info.cuh"
+
 namespace cg = cooperative_groups;
 
 #define VOCAB_SIZE 256
@@ -170,79 +172,6 @@ fused_embed_ln_kernel(
     X[pop * HIDDEN_DIM + tid] = val;
 }
 
-#ifdef USE_INT8_TC
-__global__ void __launch_bounds__(256)
-fused_embed_ln_quant_kernel(
-    const uint8_t* __restrict__ data,
-    long data_len,
-    const int8_t* __restrict__ embedding,
-    const int8_t* __restrict__ ln_w,
-    float* __restrict__ X,
-    int8_t* __restrict__ X_i8,
-    const long* __restrict__ offsets,
-    int t
-) {
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    
-    int pop = blockIdx.x;
-    int tid = threadIdx.x;
-    
-    __shared__ float smem[256];
-    __shared__ float s_mean;
-    __shared__ float warp_sums[8];
-    
-    uint8_t token = data[(offsets[pop] + t) % data_len];
-    smem[tid] = (float)embedding[token * HIDDEN_DIM + tid];
-    block.sync();
-    
-    float warp_sum = cg::reduce(warp, fabsf(smem[tid]), cg::plus<float>());
-    if (warp.thread_rank() == 0) warp_sums[tid / 32] = warp_sum;
-    block.sync();
-    
-    if (tid == 0) {
-        float sum = 0;
-        for (int i = 0; i < 8; i++) sum += warp_sums[i];
-        s_mean = fmaxf(sum / HIDDEN_DIM, 1.0f);
-    }
-    block.sync();
-    
-    float val = clip_f(smem[tid] * (float)ln_w[tid] / s_mean);
-    int idx = pop * HIDDEN_DIM + tid;
-    X[idx] = val;
-    X_i8[idx] = (int8_t)__float2int_rn(val);
-}
-
-__global__ void __launch_bounds__(256)
-fused_ln_quant_kernel(float* __restrict__ X, int8_t* __restrict__ X_i8, const int8_t* __restrict__ ln_w) {
-    cg::thread_block block = cg::this_thread_block();
-    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    
-    int pop = blockIdx.x;
-    int tid = threadIdx.x;
-    
-    float* x = X + pop * HIDDEN_DIM;
-    int8_t* x_i8 = X_i8 + pop * HIDDEN_DIM;
-    
-    __shared__ float s_mean;
-    __shared__ float warp_sums[8];
-    
-    float warp_sum = cg::reduce(warp, fabsf(x[tid]), cg::plus<float>());
-    if (warp.thread_rank() == 0) warp_sums[tid / 32] = warp_sum;
-    block.sync();
-    
-    if (tid == 0) {
-        float sum = 0;
-        for (int i = 0; i < 8; i++) sum += warp_sums[i];
-        s_mean = fmaxf(sum / HIDDEN_DIM, 1.0f);
-    }
-    block.sync();
-    
-    float val = clip_f(x[tid] * (float)ln_w[tid] / s_mean);
-    x[tid] = val;
-    x_i8[tid] = (int8_t)__float2int_rn(val);
-}
-#endif
 
 __global__ void __launch_bounds__(256)
 fused_ln_kernel(float* __restrict__ X, const int8_t* __restrict__ ln_w) {
@@ -270,6 +199,7 @@ fused_ln_kernel(float* __restrict__ X, const int8_t* __restrict__ ln_w) {
     
     x[tid] = clip_f(x[tid] * (float)ln_w[tid] / s_mean);
 }
+
 
 __global__ void __launch_bounds__(256)
 fused_perturbation_kernel(
@@ -407,109 +337,6 @@ gru_ht_update_kernel(
     X[idx] = clip_f(h_new + residual[idx]);
 }
 
-#ifdef USE_INT8_TC
-__device__ __forceinline__ int8_t clamp_i8(int32_t x) {
-    return (int8_t)max(-127, min(127, x));
-}
-
-__global__ void __launch_bounds__(256)
-gru_gate_i8_kernel(
-    const int32_t* __restrict__ gemm1,
-    const int32_t* __restrict__ gemm2,
-    const int8_t* __restrict__ bias,
-    const int8_t* __restrict__ H_i8,
-    int8_t* __restrict__ ft_i8,
-    int8_t* __restrict__ gated_past_i8,
-    uint32_t seed1,
-    uint32_t seed2
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= POPULATION_SIZE * HIDDEN_DIM) return;
-    
-    int pop = idx / HIDDEN_DIM;
-    int i = idx % HIDDEN_DIM;
-    int pair = pop / 2;
-    int is_minus = pop & 1;
-    
-    int32_t g1 = gemm1[idx] >> 8;
-    int32_t g2 = gemm2[idx] >> 8;
-    int8_t n1 = gen_noise_hash(seed1 + pair, i);
-    int8_t n2 = gen_noise_hash(seed2 + pair, i);
-    g1 += is_minus ? -(int32_t)n1 : (int32_t)n1;
-    g2 += is_minus ? -(int32_t)n2 : (int32_t)n2;
-    
-    int32_t sum = g1 + g2 + (int32_t)bias[i];
-    int8_t f = clamp_i8(sum >> 8);
-    ft_i8[idx] = f;
-    
-    int32_t h = (int32_t)H_i8[idx];
-    int32_t gated = ((int32_t)(f + 127) * h) >> 8;
-    gated_past_i8[idx] = clamp_i8(gated);
-}
-
-__global__ void __launch_bounds__(256)
-gru_ht_update_i8_kernel(
-    const int32_t* __restrict__ gemm1,
-    const int32_t* __restrict__ gemm2,
-    const int8_t* __restrict__ bias,
-    const int8_t* __restrict__ ft_i8,
-    int8_t* __restrict__ H_i8,
-    int8_t* __restrict__ X_i8,
-    const int8_t* __restrict__ residual_i8,
-    uint32_t seed1,
-    uint32_t seed2
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= POPULATION_SIZE * HIDDEN_DIM) return;
-    
-    int pop = idx / HIDDEN_DIM;
-    int i = idx % HIDDEN_DIM;
-    int pair = pop / 2;
-    int is_minus = pop & 1;
-    
-    int32_t g1 = gemm1[idx] >> 8;
-    int32_t g2 = gemm2[idx] >> 8;
-    int8_t n1 = gen_noise_hash(seed1 + pair, i);
-    int8_t n2 = gen_noise_hash(seed2 + pair, i);
-    g1 += is_minus ? -(int32_t)n1 : (int32_t)n1;
-    g2 += is_minus ? -(int32_t)n2 : (int32_t)n2;
-    
-    int32_t sum = g1 + g2 + (int32_t)bias[i];
-    int8_t ht = clamp_i8(sum >> 8);
-    
-    int8_t h_old = H_i8[idx];
-    int8_t f = ft_i8[idx];
-    int32_t update = ((int32_t)(f + 127) * (int32_t)(ht - h_old)) >> 8;
-    int8_t h_new = clamp_i8((int32_t)h_old + update);
-    
-    H_i8[idx] = h_new;
-    X_i8[idx] = clamp_i8((int32_t)h_new + (int32_t)residual_i8[idx]);
-}
-
-__global__ void __launch_bounds__(256)
-mlp_residual_i8_kernel(
-    const int32_t* __restrict__ gemm_out,
-    int8_t* __restrict__ X_i8,
-    const int8_t* __restrict__ residual_i8,
-    int shift,
-    uint32_t seed
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= POPULATION_SIZE * HIDDEN_DIM) return;
-    
-    int pop = idx / HIDDEN_DIM;
-    int i = idx % HIDDEN_DIM;
-    int pair = pop / 2;
-    int is_minus = pop & 1;
-    
-    int32_t val = gemm_out[idx] >> shift;
-    int8_t n = gen_noise_hash(seed + pair, i);
-    val += is_minus ? -(int32_t)n : (int32_t)n;
-    
-    X_i8[idx] = clamp_i8(val + (int32_t)residual_i8[idx]);
-}
-#endif
-
 __global__ void __launch_bounds__(256)
 mlp_residual_kernel(float* __restrict__ X, const float* __restrict__ residual, int shift) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -645,9 +472,9 @@ public:
     long data_len;
     
 #ifdef USE_INT8_TC
-    int8_t *d_X_i8, *d_H_i8[N_LAYERS], *d_buf1_i8, *d_buf2_i8, *d_logits_i8;
-    int8_t *d_ft_i8, *d_gated_past_i8, *d_residual_i8;
-    int32_t *d_gemm_out, *d_gemm_out2;
+    int8_t *d_X_i8, *d_H_i8[N_LAYERS], *d_buf_i8;
+    int32_t *d_gemm_out;
+    float *d_scales, *d_scales_h;
 #endif
 
 #ifdef USE_DISTRIBUTED
@@ -694,14 +521,10 @@ public:
         
 #ifdef USE_INT8_TC
         CUDA_CHECK(cudaMalloc(&d_X_i8, POPULATION_SIZE * MLP_EXPAND_DIM));
-        CUDA_CHECK(cudaMalloc(&d_buf1_i8, POPULATION_SIZE * MLP_EXPAND_DIM));
-        CUDA_CHECK(cudaMalloc(&d_buf2_i8, POPULATION_SIZE * HIDDEN_DIM));
-        CUDA_CHECK(cudaMalloc(&d_logits_i8, POPULATION_SIZE * VOCAB_SIZE));
+        CUDA_CHECK(cudaMalloc(&d_buf_i8, POPULATION_SIZE * MLP_EXPAND_DIM));
         CUDA_CHECK(cudaMalloc(&d_gemm_out, POPULATION_SIZE * MLP_EXPAND_DIM * sizeof(int32_t)));
-        CUDA_CHECK(cudaMalloc(&d_gemm_out2, POPULATION_SIZE * HIDDEN_DIM * sizeof(int32_t)));
-        CUDA_CHECK(cudaMalloc(&d_ft_i8, POPULATION_SIZE * HIDDEN_DIM));
-        CUDA_CHECK(cudaMalloc(&d_gated_past_i8, POPULATION_SIZE * HIDDEN_DIM));
-        CUDA_CHECK(cudaMalloc(&d_residual_i8, POPULATION_SIZE * HIDDEN_DIM));
+        CUDA_CHECK(cudaMalloc(&d_scales, POPULATION_SIZE * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_scales_h, POPULATION_SIZE * sizeof(float)));
         for (int l = 0; l < N_LAYERS; l++)
             CUDA_CHECK(cudaMalloc(&d_H_i8[l], POPULATION_SIZE * HIDDEN_DIM));
 #endif
@@ -731,7 +554,8 @@ public:
         cudaFree(d_offsets); cudaFree(d_fit); cudaFree(d_losses);
         if (d_data) cudaFree(d_data);
 #ifdef USE_INT8_TC
-        cudaFree(d_X_i8); cudaFree(d_buf1_i8); cudaFree(d_buf2_i8); cudaFree(d_logits_i8); cudaFree(d_gemm_out);
+        cudaFree(d_X_i8); cudaFree(d_buf_i8); cudaFree(d_gemm_out);
+        cudaFree(d_scales); cudaFree(d_scales_h);
         for (int l = 0; l < N_LAYERS; l++) cudaFree(d_H_i8[l]);
 #endif
 #ifdef USE_DISTRIBUTED
@@ -768,48 +592,6 @@ public:
         CUDA_CHECK(cudaMemcpy(d_data, data, len, cudaMemcpyHostToDevice));
     }
     
-#ifdef USE_INT8_TC
-    void int8_gemm_fused_perturb(
-        float* out, const float* X, const int8_t* W,
-        int batch, int out_dim, int in_dim,
-        int8_t* X_i8_buf, int32_t* gemm_buf,
-        uint32_t seed
-    ) {
-        int total_in = batch * in_dim;
-        quantize_kernel<<<(total_in + 255) / 256, 256>>>(X_i8_buf, X, total_in);
-        int8_gemm_tn(gemm_buf, W, X_i8_buf, out_dim, batch, in_dim);
-        fused_dequant_perturb_kernel<<<PAIRS, 256>>>(out, gemm_buf, X_i8_buf, out_dim, in_dim, batch, seed);
-    }
-    
-    void int8_gemm_pure_i8(
-        int8_t* out_i8,
-        const int8_t* X_i8, const int8_t* W,
-        int batch, int out_dim, int in_dim,
-        int32_t* gemm_buf,
-        uint32_t seed,
-        int shift = 8
-    ) {
-        int8_gemm_tn(gemm_buf, W, X_i8, out_dim, batch, in_dim);
-        fused_i32_perturb_to_i8_kernel<<<PAIRS, 256>>>(out_i8, gemm_buf, X_i8, out_dim, in_dim, batch, seed, shift);
-    }
-    
-    void int8_gemm_to_float(
-        float* out_f32,
-        const int8_t* X_i8, const int8_t* W,
-        int batch, int out_dim, int in_dim,
-        int32_t* gemm_buf,
-        uint32_t seed,
-        int shift = 8
-    ) {
-        int8_gemm_tn(gemm_buf, W, X_i8, out_dim, batch, in_dim);
-        fused_dequant_perturb_kernel<<<PAIRS, 256>>>(out_f32, gemm_buf, X_i8, out_dim, in_dim, batch, seed);
-    }
-    
-    void int8_gemm_raw(int32_t* out, const int8_t* X_i8, const int8_t* W, int batch, int out_dim, int in_dim) {
-        int8_gemm_tn(out, W, X_i8, out_dim, batch, in_dim);
-    }
-#endif
-    
     int forward_step(long start_idx, uint32_t step_seed, int* h_fit, int32_t* h_loss) {
         long stride = data_len / PAIRS;
         
@@ -823,9 +605,6 @@ public:
         
         for (int l = 0; l < N_LAYERS; l++) {
             CUDA_CHECK(cudaMemsetAsync(d_H[l], 0, POPULATION_SIZE * HIDDEN_DIM * sizeof(float)));
-#ifdef USE_INT8_TC
-            CUDA_CHECK(cudaMemsetAsync(d_H_i8[l], 0, POPULATION_SIZE * HIDDEN_DIM));
-#endif
         }
         CUDA_CHECK(cudaMemsetAsync(d_losses, 0, POPULATION_SIZE * sizeof(int32_t)));
         
@@ -836,11 +615,7 @@ public:
         
         for (int t = 0; t < SEQ_LEN; t++) {
             const int8_t* ln_w0 = d_ln_w;
-#ifdef USE_INT8_TC
-            fused_embed_ln_quant_kernel<<<POPULATION_SIZE, HIDDEN_DIM>>>(d_data, data_len, d_emb, ln_w0, d_X, d_X_i8, d_offsets, t);
-#else
             fused_embed_ln_kernel<<<POPULATION_SIZE, HIDDEN_DIM>>>(d_data, data_len, d_emb, ln_w0, d_X, d_offsets, t);
-#endif
             
             for (int l = 0; l < N_LAYERS; l++) {
                 uint32_t l_seed = step_seed + l * 1000;
@@ -862,22 +637,47 @@ public:
                 const int8_t* gru_w3 = gru_w2 + HIDDEN_DIM * HIDDEN_DIM;
                 const int8_t* mlp_w0 = d_mlp_w + l * 2 * HIDDEN_DIM * MLP_EXPAND_DIM;
                 const int8_t* mlp_w1 = mlp_w0 + HIDDEN_DIM * MLP_EXPAND_DIM;
+                float w_scale = 1.0f;
                 
-                int8_gemm_to_float(d_buf1, d_X_i8, gru_w0, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_gemm_out, l_seed+1, 8);
-                int8_gemm_to_float(d_buf2, d_H_i8[l], gru_w1, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_gemm_out, l_seed+2, 8);
+                quantize_dynamic_kernel<<<POPULATION_SIZE, 256>>>(d_X_i8, d_scales, d_X, HIDDEN_DIM, POPULATION_SIZE);
+                quantize_dynamic_kernel<<<POPULATION_SIZE, 256>>>(d_H_i8[l], d_scales_h, d_H[l], HIDDEN_DIM, POPULATION_SIZE);
+                
+                int8_gemm_tn(d_gemm_out, gru_w0, d_X_i8, HIDDEN_DIM, POPULATION_SIZE, HIDDEN_DIM);
+                dequant_dynamic_kernel<<<(total_hd+255)/256, 256>>>(d_buf1, d_gemm_out, d_scales, w_scale, HIDDEN_DIM, POPULATION_SIZE);
+                fused_perturbation_kernel<<<PAIRS, 256>>>(d_buf1, d_X, HIDDEN_DIM, HIDDEN_DIM, l_seed+1);
+                
+                int8_gemm_tn(d_gemm_out, gru_w1, d_H_i8[l], HIDDEN_DIM, POPULATION_SIZE, HIDDEN_DIM);
+                dequant_dynamic_kernel<<<(total_hd+255)/256, 256>>>(d_buf2, d_gemm_out, d_scales_h, w_scale, HIDDEN_DIM, POPULATION_SIZE);
+                fused_perturbation_kernel<<<PAIRS, 256>>>(d_buf2, d_H[l], HIDDEN_DIM, HIDDEN_DIM, l_seed+2);
+                
                 gru_gate_kernel<<<(total_hd+255)/256, 256>>>(d_buf1, d_buf2, bias_f, d_H[l], d_ft, d_gated_past);
                 
-                int8_gemm_to_float(d_buf1, d_X_i8, gru_w2, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_gemm_out, l_seed+3, 8);
-                quantize_kernel<<<(total_hd + 255) / 256, 256>>>(d_buf2_i8, d_gated_past, total_hd);
-                int8_gemm_to_float(d_buf2, d_buf2_i8, gru_w3, POPULATION_SIZE, HIDDEN_DIM, HIDDEN_DIM, d_gemm_out, l_seed+4, 8);
+                int8_gemm_tn(d_gemm_out, gru_w2, d_X_i8, HIDDEN_DIM, POPULATION_SIZE, HIDDEN_DIM);
+                dequant_dynamic_kernel<<<(total_hd+255)/256, 256>>>(d_buf1, d_gemm_out, d_scales, w_scale, HIDDEN_DIM, POPULATION_SIZE);
+                fused_perturbation_kernel<<<PAIRS, 256>>>(d_buf1, d_X, HIDDEN_DIM, HIDDEN_DIM, l_seed+3);
+                
+                quantize_dynamic_kernel<<<POPULATION_SIZE, 256>>>(d_buf_i8, d_scales, d_gated_past, HIDDEN_DIM, POPULATION_SIZE);
+                int8_gemm_tn(d_gemm_out, gru_w3, d_buf_i8, HIDDEN_DIM, POPULATION_SIZE, HIDDEN_DIM);
+                dequant_dynamic_kernel<<<(total_hd+255)/256, 256>>>(d_buf2, d_gemm_out, d_scales, w_scale, HIDDEN_DIM, POPULATION_SIZE);
+                fused_perturbation_kernel<<<PAIRS, 256>>>(d_buf2, d_gated_past, HIDDEN_DIM, HIDDEN_DIM, l_seed+4);
+                
                 gru_ht_update_kernel<<<(total_hd+255)/256, 256>>>(d_buf1, d_buf2, bias_h, d_ft, d_H[l], d_X, d_residual);
                 
                 CUDA_CHECK(cudaMemcpyAsync(d_residual, d_X, total_hd * sizeof(float), cudaMemcpyDeviceToDevice));
-                fused_ln_quant_kernel<<<POPULATION_SIZE, HIDDEN_DIM>>>(d_X, d_X_i8, ln_w1);
+                fused_ln_kernel<<<POPULATION_SIZE, HIDDEN_DIM>>>(d_X, ln_w1);
                 
-                int8_gemm_pure_i8(d_buf1_i8, d_X_i8, mlp_w0, POPULATION_SIZE, MLP_EXPAND_DIM, HIDDEN_DIM, d_gemm_out, l_seed+5, 8);
-                int8_gemm_to_float(d_X, d_buf1_i8, mlp_w1, POPULATION_SIZE, HIDDEN_DIM, MLP_EXPAND_DIM, d_gemm_out, l_seed+6, 8);
-                mlp_residual_kernel<<<(total_hd+255)/256, 256>>>(d_X, d_residual, 9);
+                quantize_dynamic_kernel<<<POPULATION_SIZE, 256>>>(d_X_i8, d_scales, d_X, HIDDEN_DIM, POPULATION_SIZE);
+                int total_mlp = POPULATION_SIZE * MLP_EXPAND_DIM;
+                int8_gemm_tn(d_gemm_out, mlp_w0, d_X_i8, MLP_EXPAND_DIM, POPULATION_SIZE, HIDDEN_DIM);
+                dequant_dynamic_kernel<<<(total_mlp+255)/256, 256>>>(d_buf1, d_gemm_out, d_scales, w_scale, MLP_EXPAND_DIM, POPULATION_SIZE);
+                fused_perturbation_kernel<<<PAIRS, 256>>>(d_buf1, d_X, MLP_EXPAND_DIM, HIDDEN_DIM, l_seed+5);
+                
+                quantize_dynamic_kernel<<<POPULATION_SIZE, 256>>>(d_buf_i8, d_scales, d_buf1, MLP_EXPAND_DIM, POPULATION_SIZE);
+                int8_gemm_tn(d_gemm_out, mlp_w1, d_buf_i8, HIDDEN_DIM, POPULATION_SIZE, MLP_EXPAND_DIM);
+                dequant_dynamic_kernel<<<(total_hd+255)/256, 256>>>(d_X, d_gemm_out, d_scales, w_scale, HIDDEN_DIM, POPULATION_SIZE);
+                fused_perturbation_kernel<<<PAIRS, 256>>>(d_X, d_buf1, HIDDEN_DIM, MLP_EXPAND_DIM, l_seed+6);
+                
+                mlp_residual_kernel<<<(total_hd+255)/256, 256>>>(d_X, d_residual, 17);
 #else
                 CUBLAS_CHECK(cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                     HIDDEN_DIM, POPULATION_SIZE, HIDDEN_DIM, &alpha,
@@ -922,8 +722,11 @@ public:
             
             fused_ln_kernel<<<POPULATION_SIZE, HIDDEN_DIM>>>(d_X, d_ln_out);
 #ifdef USE_INT8_TC
-            int8_gemm_fused_perturb(d_logits, d_X, d_head, POPULATION_SIZE, VOCAB_SIZE, HIDDEN_DIM,
-                                    d_X_i8, d_gemm_out, step_seed+999);
+            quantize_dynamic_kernel<<<POPULATION_SIZE, 256>>>(d_X_i8, d_scales, d_X, HIDDEN_DIM, POPULATION_SIZE);
+            int total_vocab = POPULATION_SIZE * VOCAB_SIZE;
+            int8_gemm_tn(d_gemm_out, d_head, d_X_i8, VOCAB_SIZE, POPULATION_SIZE, HIDDEN_DIM);
+            dequant_dynamic_kernel<<<(total_vocab+255)/256, 256>>>(d_logits, d_gemm_out, d_scales, 1.0f, VOCAB_SIZE, POPULATION_SIZE);
+            fused_perturbation_kernel<<<PAIRS, 256>>>(d_logits, d_X, VOCAB_SIZE, HIDDEN_DIM, step_seed+999);
 #else
             CUBLAS_CHECK(cublasSgemm(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                 VOCAB_SIZE, POPULATION_SIZE, HIDDEN_DIM, &alpha,
@@ -1064,8 +867,15 @@ int main() {
     g_total_pairs = g_total_population / 2;
     
     printf("=== EGGROLL Distributed Training ===\n");
-    b200::print_topology();
+    egg::print_gpu_topology();
     b200::enable_p2p_access(g_num_gpus);
+#ifdef USE_INT8_TC
+    egg::print_config_distributed(g_num_gpus, POPULATION_SIZE_PER_GPU, g_total_population,
+                                  HIDDEN_DIM, MLP_EXPAND_DIM, N_LAYERS, SEQ_LEN, VOCAB_SIZE, true);
+#else
+    egg::print_config_distributed(g_num_gpus, POPULATION_SIZE_PER_GPU, g_total_population,
+                                  HIDDEN_DIM, MLP_EXPAND_DIM, N_LAYERS, SEQ_LEN, VOCAB_SIZE, false);
+#endif
     
     for (int g = 0; g < g_num_gpus; g++) {
         cudaSetDevice(g);
@@ -1112,13 +922,10 @@ int main() {
     global_threshold_ctrl.threshold *= g_num_gpus;
     
 #ifdef USE_INT8_TC
-    printf("Training: H=%d L=%d S=%d P=%d x %d GPUs = %d total (INT8 Synchronized)\n", 
-           HIDDEN_DIM, N_LAYERS, SEQ_LEN, POPULATION_SIZE_PER_GPU, g_num_gpus, g_total_population);
+    egg::print_training_start(HIDDEN_DIM, N_LAYERS, SEQ_LEN, POPULATION_SIZE_PER_GPU, g_num_gpus, g_total_population, true);
 #else
-    printf("Training: H=%d L=%d S=%d P=%d x %d GPUs = %d total (TF32 Synchronized)\n",
-           HIDDEN_DIM, N_LAYERS, SEQ_LEN, POPULATION_SIZE_PER_GPU, g_num_gpus, g_total_population);
+    egg::print_training_start(HIDDEN_DIM, N_LAYERS, SEQ_LEN, POPULATION_SIZE_PER_GPU, g_num_gpus, g_total_population, false);
 #endif
-    fflush(stdout);
     
     long max_steps = (len - 1) / SEQ_LEN;
     
@@ -1132,7 +939,7 @@ int main() {
         #pragma omp parallel for num_threads(g_num_gpus)
         for (int g = 0; g < g_num_gpus; g++) {
             cudaSetDevice(g);
-            // Data parallelism: SAME perturbation, DIFFERENT data slices per GPU
+            // DP: same perturbation with different data slices per GPU rank
             long gpu_offset = idx + g * (len / g_num_gpus);
             trainers[g]->forward_step(gpu_offset % (len - SEQ_LEN - 1), base_seed, fit[g], loss[g]);
         }
@@ -1238,11 +1045,7 @@ int main() {
             printf("%c", (c >= 32 && c <= 126) ? c : '.');
         }
         printf("\033[36m..............................\033[0m\n");
-        printf("Step %ld | Loss: %.4f | Thr: %d | +: %d | -: %d | %.1f ms\n",
-               step, avg_loss, global_threshold, total_pos, total_neg, ms);
-        printf("reduce: GPU[0-%d] -> host | update: GPU[0-%d] | sync: GPU0 -> [1-%d] (%.1fMB via NVLink)\n\n",
-               g_num_gpus-1, g_num_gpus-1, g_num_gpus-1, sync_mb);
-        fflush(stdout);
+        egg::print_distributed_step(step, avg_loss, global_threshold, total_pos, total_neg, ms, g_num_gpus, sync_mb);
     }
     
     printf("Done.\n");
@@ -1271,6 +1074,12 @@ int main() {
     srand(time(NULL));
     init_tables();
     
+#ifdef USE_INT8_TC
+    egg::print_config(POPULATION_SIZE, HIDDEN_DIM, MLP_EXPAND_DIM, N_LAYERS, SEQ_LEN, VOCAB_SIZE, true);
+#else
+    egg::print_config(POPULATION_SIZE, HIDDEN_DIM, MLP_EXPAND_DIM, N_LAYERS, SEQ_LEN, VOCAB_SIZE, false);
+#endif
+    
     FILE* f = fopen("input.txt", "rb");
     if (!f) { printf("Error: input.txt not found\n"); return 1; }
     fseek(f, 0, SEEK_END);
@@ -1292,14 +1101,6 @@ int main() {
     
     int* fit = (int*)malloc(PAIRS * sizeof(int));
     int32_t* loss = (int32_t*)malloc(POPULATION_SIZE * sizeof(int32_t));
-    
-#ifdef USE_INT8_TC
-    printf("Training: H=%d L=%d S=%d P=%d (INT8 Tensor Cores)\n", HIDDEN_DIM, N_LAYERS, SEQ_LEN, POPULATION_SIZE);
-    print_int8_tc_info();
-#else
-    printf("Training: H=%d L=%d S=%d P=%d (cuBLAS TF32)\n", HIDDEN_DIM, N_LAYERS, SEQ_LEN, POPULATION_SIZE);
-#endif
-    fflush(stdout);
     
     long max_steps = (len - 1) / SEQ_LEN;
     

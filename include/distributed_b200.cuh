@@ -22,29 +22,6 @@
 
 namespace b200 {
 
-inline void print_topology() {
-    int num_gpus;
-    CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
-    printf("=== B200 Cluster Topology ===\n");
-    for (int i = 0; i < num_gpus; ++i) {
-        cudaDeviceProp prop;
-        CUDA_CHECK(cudaGetDeviceProperties(&prop, i));
-        printf("GPU %d: %s (SM %.1f, %d SMs, %.1f GB)\n",
-            i, prop.name, (float)prop.major + (float)prop.minor / 10.0f,
-            prop.multiProcessorCount, (float)prop.totalGlobalMem / (1024 * 1024 * 1024));
-        
-        printf("  NVLink peers: ");
-        for (int j = 0; j < num_gpus; ++j) {
-            if (i == j) continue;
-            int can_access;
-            cudaDeviceCanAccessPeer(&can_access, i, j);
-            if (can_access) printf("%d ", j);
-        }
-        printf("\n");
-    }
-    printf("=============================\n\n");
-}
-
 inline void enable_p2p_access(int num_gpus) {
     for (int i = 0; i < num_gpus; i++) {
         cudaSetDevice(i);
